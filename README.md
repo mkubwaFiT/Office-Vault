@@ -81,14 +81,22 @@ and "open location" falls back to `open`/`xdg-open`.
 
 ## Safety
 
-Several actions are **destructive and irreversible**:
+Destructive actions are designed to be **recoverable** and **hard to trigger by accident**:
 
-- **Deep Purge** deletes the original file from disk and edits the registry.
-- **Delete Selected File** (Security tab) permanently removes files from the system.
+- **All deletions go to the Recycle Bin / Trash**, never a permanent wipe — vault
+  deletes, duplicate removal, the Security-tab delete, and Deep Purge alike. If
+  the OS trash is unavailable, the file is moved to a local
+  `~/TextVault_Data/_RecycleBin/` backup instead. The app never hard-deletes data.
+- **Deep Purge requires type-to-confirm.** Because it also removes the *original*
+  file on disk and scrubs registry traces, you must type `PURGE` to proceed — a
+  reflexive "Yes" click is not enough.
+- **Confirmation dialogs default to "No"**, so pressing Enter or mis-clicking cancels.
 
-Each is gated behind a confirmation dialog. User content is never committed to
-git — `TextVault_Data/`, `vault_metadata.json`, build artifacts, and `*.exe` are
-all `.gitignore`d.
+The Recycle-Bin behavior is dependency-free: Windows `SHFileOperation` (`FOF_ALLOWUNDO`)
+via `ctypes`, macOS Finder via AppleScript, Linux freedesktop trash.
+
+User content is never committed to git — `TextVault_Data/`, `vault_metadata.json`,
+build artifacts, and `*.exe` are all `.gitignore`d.
 
 ## Repository layout
 

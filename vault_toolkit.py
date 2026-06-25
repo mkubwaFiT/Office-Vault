@@ -8,7 +8,7 @@ import subprocess
 import hashlib
 import threading
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, simpledialog
 from collections import Counter
 
 # winreg / explorer / Defender are Windows-only. Guard the import so the
@@ -230,7 +230,7 @@ class VaultToolkitApp:
                     filename = os.path.basename(filepath)
                     try:
                         if os.path.exists(filepath):
-                            os.remove(filepath)
+                            self._safe_delete(filepath)
                         if filename in self.metadata["files"]:
                             del self.metadata["files"][filename]
                         if filepath in self.file_cache:
@@ -291,6 +291,96 @@ class VaultToolkitApp:
         except Exception as e:
             messagebox.showerror("Error", f"Failed to open location:\n{e}")
 
+    # ------------------------------------------------------------------
+    # Recoverable deletion: route everything through the OS Recycle Bin /
+    # Trash so an accidental click is never an irreversible wipe. Falls back
+    # to a local _RecycleBin folder; NEVER does a hard os.remove() of data.
+    # Dependency-free (stdlib + ctypes on Windows).
+    # ------------------------------------------------------------------
+    def _safe_delete(self, path):
+        """Move `path` to the OS trash; on failure, to ~/TextVault_Data/_RecycleBin.
+        Returns True if the file is no longer at its original location."""
+        if not path or not os.path.exists(path):
+            return True
+        if self._send_to_trash(path):
+            return True
+        # Safety net: relocate into a local recycle bin rather than deleting.
+        try:
+            backup_dir = os.path.join(self.vault_dir, "_RecycleBin")
+            os.makedirs(backup_dir, exist_ok=True)
+            dest = os.path.join(backup_dir, f"{int(time.time())}_{os.path.basename(path)}")
+            counter = 1
+            while os.path.exists(dest):
+                dest = os.path.join(backup_dir, f"{int(time.time())}_{counter}_{os.path.basename(path)}")
+                counter += 1
+            shutil.move(path, dest)
+            return True
+        except Exception as e:
+            print(f"Safe-delete fallback failed for {path}: {e}")
+            return False
+
+    def _send_to_trash(self, path):
+        """Best-effort move to the OS Recycle Bin / Trash. Returns True on success."""
+        path = os.path.abspath(path)
+        try:
+            if IS_WINDOWS:
+                import ctypes
+                from ctypes import wintypes
+
+                FO_DELETE = 3
+                FOF_ALLOWUNDO = 0x0040       # send to Recycle Bin instead of deleting
+                FOF_NOCONFIRMATION = 0x0010  # we already confirmed in the UI
+                FOF_SILENT = 0x0004
+                FOF_NOERRORUI = 0x0400
+
+                class SHFILEOPSTRUCTW(ctypes.Structure):
+                    _fields_ = [
+                        ("hwnd", wintypes.HWND),
+                        ("wFunc", wintypes.UINT),
+                        ("pFrom", wintypes.LPCWSTR),
+                        ("pTo", wintypes.LPCWSTR),
+                        ("fFlags", ctypes.c_uint16),
+                        ("fAnyOperationsAborted", wintypes.BOOL),
+                        ("hNameMappings", ctypes.c_void_p),
+                        ("lpszProgressTitle", wintypes.LPCWSTR),
+                    ]
+
+                op = SHFILEOPSTRUCTW()
+                op.wFunc = FO_DELETE
+                op.pFrom = path + "\0"  # path list must be double-null terminated
+                op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI
+                res = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
+                return res == 0 and not op.fAnyOperationsAborted
+
+            elif sys.platform == "darwin":
+                # Hand off to Finder so it lands in the user's Trash properly.
+                script = f'tell application "Finder" to delete POSIX file "{path}"'
+                return subprocess.call(
+                    ["osascript", "-e", script],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                ) == 0
+
+            else:
+                # Freedesktop trash spec (~/.local/share/Trash)
+                trash = os.path.join(os.path.expanduser("~"), ".local", "share", "Trash")
+                files_dir = os.path.join(trash, "files")
+                info_dir = os.path.join(trash, "info")
+                os.makedirs(files_dir, exist_ok=True)
+                os.makedirs(info_dir, exist_ok=True)
+                base = os.path.basename(path)
+                dest = os.path.join(files_dir, base)
+                counter = 1
+                while os.path.exists(dest):
+                    dest = os.path.join(files_dir, f"{base}.{counter}")
+                    counter += 1
+                with open(os.path.join(info_dir, os.path.basename(dest) + ".trashinfo"), "w") as f:
+                    f.write(f"[Trash Info]\nPath={path}\nDeletionDate={time.strftime('%Y-%m-%dT%H:%M:%S')}\n")
+                shutil.move(path, dest)
+                return True
+        except Exception as e:
+            print(f"Trash failed for {path}: {e}")
+            return False
+
     def deep_reset_reports(self):
         if not messagebox.askyesno("Reset Reports", "Are you sure you want to permanently delete all generated Vault Reports?"):
             return
@@ -300,7 +390,7 @@ class VaultToolkitApp:
             if filename.startswith("Vault_Report_") and filename.endswith(".txt"):
                 filepath = os.path.join(self.vault_dir, filename)
                 try:
-                    os.remove(filepath)
+                    self._safe_delete(filepath)
                     deleted_count += 1
                     if filename in self.metadata["files"]:
                         del self.metadata["files"][filename]
@@ -606,7 +696,7 @@ class VaultToolkitApp:
             removed = 0
             for dup_path, orig_path in duplicates:
                 try:
-                    os.remove(dup_path)
+                    self._safe_delete(dup_path)
                     filename = os.path.basename(dup_path)
                     if filename in self.metadata["files"]:
                         del self.metadata["files"][filename]
@@ -656,17 +746,26 @@ class VaultToolkitApp:
         if not selections:
             return
 
-        if messagebox.askyesno("Warning", f"Permanently delete {len(selections)} file(s) from your system?"):
-            for item_id in selections:
-                item = self.sec_tree.item(item_id)
-                path = item['values'][1]
-                try:
-                    if os.path.exists(path):
-                        os.remove(path)
-                    self.sec_tree.delete(item_id)
-                except Exception as e:
-                    print(f"Error deleting {path}: {e}")
-            messagebox.showinfo("Success", "Selected file(s) deleted.")
+        # Default to "No" so a stray Enter/click cancels. Deletes are recoverable.
+        if not messagebox.askyesno(
+            "Confirm Delete",
+            f"Send {len(selections)} flagged file(s) to the Recycle Bin / Trash?\n\n"
+            "These are files on your system, outside the vault. They will remain "
+            "recoverable from the Recycle Bin.",
+            default="no", icon="warning",
+        ):
+            return
+
+        removed = 0
+        for item_id in selections:
+            item = self.sec_tree.item(item_id)
+            path = item['values'][1]
+            if self._safe_delete(path):
+                self.sec_tree.delete(item_id)
+                removed += 1
+            else:
+                print(f"Could not delete {path}")
+        messagebox.showinfo("Done", f"Sent {removed} file(s) to the Recycle Bin / Trash.")
 
     def run_defender_scan(self):
         if not IS_WINDOWS:
@@ -705,7 +804,19 @@ class VaultToolkitApp:
         if not selections:
             return
 
-        if not messagebox.askyesno("Deep Purge Confirmation", f"WARNING: You are about to deeply purge {len(selections)} file(s).\nThis will delete the file from the Vault, Original Location, and attempt to scrub Recent File Registries.\n\nProceed?"):
+        # Type-to-confirm: Deep Purge deletes the ORIGINAL file on disk and edits
+        # the registry, so a reflexive "Yes" click must never be enough.
+        prompt = (
+            f"You are about to DEEP PURGE {len(selections)} file(s).\n\n"
+            "This removes each file from the Vault AND its original location on "
+            "disk, and scrubs Windows Recent-Docs registry traces.\n\n"
+            "Deleted files are sent to the Recycle Bin / Trash where possible, so "
+            "they stay recoverable.\n\n"
+            "Type  PURGE  (in capitals) to confirm:"
+        )
+        answer = simpledialog.askstring("Confirm Deep Purge", prompt, parent=self.root)
+        if answer != "PURGE":
+            messagebox.showinfo("Cancelled", "Deep Purge cancelled — no files were deleted.")
             return
 
         purged = 0
@@ -713,18 +824,11 @@ class VaultToolkitApp:
             item = self.purge_tree.item(item_id)
             filename, vault_path, original_path = item['values']
 
-            try:
-                if os.path.exists(vault_path):
-                    os.remove(vault_path)
-            except Exception:
-                pass
+            if os.path.exists(vault_path):
+                self._safe_delete(vault_path)
 
-            if original_path != "Vault Local":
-                try:
-                    if os.path.exists(original_path):
-                        os.remove(original_path)
-                except Exception:
-                    pass
+            if original_path != "Vault Local" and os.path.exists(original_path):
+                self._safe_delete(original_path)
 
             if filename in self.metadata["files"]:
                 del self.metadata["files"][filename]
