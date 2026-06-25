@@ -13,6 +13,16 @@ Windows Recent-Docs registry scrubbing).
 
 ---
 
+## Download
+
+**[Download the latest Windows build →](https://github.com/mkubwaFiT/Office-Vault/releases/latest)** (Windows 10/11, 64-bit)
+
+Grab `Vault_Toolkit-vX.Y.Z-windows-x64.zip`, **extract the whole ZIP**, and run
+`Vault_Toolkit/Vault_Toolkit.exe`. Keep the `.exe` and its `_internal/` folder
+together — it's a fast-start *folder* build, not a lone `.exe`. A `.sha256` file
+is attached if you want to verify the download. (First launch may show a
+SmartScreen notice because the build is unsigned → *More info → Run anyway*.)
+
 ## Features
 
 - **Unified indexing** — point it at any folder or drive; it syncs both
@@ -60,6 +70,28 @@ python vault_toolkit.py
 The vault lives in `~/TextVault_Data/` (kept for backward compatibility with
 existing metadata).
 
+## Usage
+
+1. **Index** — click *Index Drive/Folder* and choose a folder or drive. Tracked
+   files (`.txt` + Office docs) are copied into the vault; indexed folders are
+   remembered and re-synced in the background on next launch.
+2. **Browse** — the left tree groups files by source folder, then category.
+   Click a `.txt` note to edit it in the **Editor** tab (edits auto-save). Office
+   files open read-only — right-click → *Open Original Location* to edit them in
+   Office.
+3. **Search** — type in the search box to filter live (`.txt` matches filename
+   *and* content; Office matches filename).
+4. **Notes** — *New Note* creates a draft; *Save Current* writes it.
+5. **Tidy up** — *Find & Remove Duplicates* removes exact-duplicate copies;
+   *Vault Report* writes a summary; *Open Reports* / *Deep Reset Reports* manage them.
+6. **Security tab** — review executables/scripts flagged during indexing; run a
+   *Defender Scan*, or send a flagged file to the Recycle Bin.
+7. **Deep Purge tab** — select files and *Deep Delete* to remove them from the
+   vault, their original location, and the Windows RecentDocs registry. This
+   action asks you to type `PURGE` to confirm.
+
+All deletions go to the Recycle Bin / Trash — see [Safety](#safety).
+
 ## Building the executable (Windows)
 
 PyInstaller produces a binary for the OS it runs on, so build on **Windows**:
@@ -105,7 +137,14 @@ build artifacts, and `*.exe` are all `.gitignore`d.
 | `vault_toolkit.py` | The application (Tkinter, single file). |
 | `Vault_Toolkit.spec` | PyInstaller spec — fast-launch onedir/no-UPX config. |
 | `build_vault.py` | Build script: cleans artifacts and builds from the spec. |
+| `README.md` | This document. |
+| `CHANGELOG.md` | Version history. |
+| `LICENSE` | MIT license. |
 | `.gitignore` | Excludes build output, caches, executables, and vault data. |
+
+## License
+
+Released under the [MIT License](LICENSE) — © 2026 KIMANI S.M.
 
 ## Credits
 
