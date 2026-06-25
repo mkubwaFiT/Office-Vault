@@ -3,6 +3,10 @@ build/
 dist/
 *.spec.bak
 
+# PyInstaller onedir runtime bundle (if built into / copied to the repo root)
+_internal/
+Vault_Toolkit/
+
 # Compiled / cache
 __pycache__/
 *.py[cod]
