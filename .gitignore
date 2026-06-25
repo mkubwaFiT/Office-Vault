@@ -1,0 +1,23 @@
+# PyInstaller build artifacts
+build/
+dist/
+*.spec.bak
+
+# Compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Built executables (produced by build_vault.py, not source)
+*.exe
+
+# Runtime vault data (user content / metadata, never commit)
+TextVault_Data/
+vault_metadata.json
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
