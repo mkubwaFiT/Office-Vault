@@ -25,35 +25,55 @@ SmartScreen notice because the build is unsigned → *More info → Run anyway*.
 
 ## Features
 
-- **Unified indexing** — point it at any folder or drive; it syncs both
-  `.txt` notes and MS Office binaries (`.doc/.docx`, `.xls/.xlsx`, `.ppt/.pptx`)
-  into a local vault and remembers indexed folders across sessions.
-- **Smart organization** — files are grouped by source folder, then by category:
-  `.txt` notes are auto-categorized by their dominant keyword; Office files by type.
-- **Inline editor** — edit and auto-save `.txt` notes. Office binaries open
-  **read-only** with a clear notice, so they can never be corrupted by the editor.
-- **Search** — filter the tree live; `.txt` matches on filename *and* content,
-  Office files match on filename.
+- **Full-text search across everything** — a SQLite **FTS5** index lets you find
+  words *inside* `.txt` notes **and** Office documents (`.docx/.xlsx/.pptx` text is
+  extracted at index time). Results show matching files with a highlighted snippet.
+  Toggle between full-text and filename search; the box is debounced so typing
+  never stalls. (Falls back to `LIKE` search if FTS5 is unavailable.)
+- **Scales to large disks — index in place** — indexing catalogs files where they
+  live instead of copying every document into the vault, and runs in a
+  **cancellable** background scan with a live progress/count and a **Cancel** button.
+- **Real previews** — `.docx/.xlsx/.pptx` show extracted text; large `.txt` files
+  page in on demand (*Load more*) so nothing freezes; legacy `.doc/.xls/.ppt`
+  (pre-2007 OLE) show a clear "open in Office" notice.
+- **Navigation & editing** — lazy-loaded tree grouped by source → category,
+  **Back/Forward** history, **Clear** / **Clear-search**, and shortcuts
+  (`Ctrl+F`, `Ctrl+S`, `Esc`, `Alt+←/→`). In-app notes are editable with auto-save;
+  indexed documents are read-only.
 - **Duplicate finder** — chunked SHA-256 hashing flags and removes exact duplicates.
 - **Security tab** — executables/scripts found while indexing (`.exe`, `.bat`,
   `.ps1`, `.vbs`, `.scr`, `.dll`, `.js`, `.wsf`) are flagged; run an on-demand
-  Windows Defender scan or delete them.
-- **Deep Purge** — remove a file from the vault, its original location, **and**
+  Windows Defender scan or send them to the Recycle Bin.
+- **Deep Purge** — remove a file from the index, its original location, **and**
   scrub its traces from the Windows Explorer `RecentDocs` MRU registry.
 - **Vault report** — generate a summary report (Japanese-localized).
 
+## Architecture
+
+The app is layered (single file, stdlib only):
+
+| Layer | Responsibility |
+|-------|----------------|
+| `TextExtractor` | Stdlib text extraction for `.txt` + OOXML (`zipfile` + `xml.etree`). |
+| `VaultStore` | SQLite catalog with an FTS5 virtual table (LIKE fallback). |
+| `Indexer` | Cancellable, streaming, batched background disk scanner. |
+| `VaultToolkitApp` | Tkinter UI: browse / search / preview / security / purge. |
+
+Data lives in `~/TextVault_Data/`: a `vault.db` catalog, in-app notes under
+`Notes/`, a `vault.log`, and a `_RecycleBin/` delete fallback. An existing
+`vault_metadata.json` from v1 is imported automatically on first run.
+
 ## Performance
 
-The previous builds launched slowly. This version fixes that at two layers:
+Startup and large-disk handling are addressed at two layers:
 
 - **Build:** `Vault_Toolkit.spec` uses a **onedir, no-UPX** configuration instead
-  of `--onefile` + UPX. One-file builds re-extract the entire ~11 MB Python/Tk
-  runtime into `%TEMP%` on *every* launch, and UPX both decompresses at launch and
-  frequently trips Windows Defender into re-scanning the binary. Onedir runs
-  straight from its folder.
-- **Runtime:** folder re-indexing runs on a **background thread after the window
-  paints**, so startup is instant even when whole drives are indexed. All
-  filesystem work happens off the UI thread; results are marshaled back safely.
+  of `--onefile` + UPX, avoiding a full runtime re-extraction (and Defender
+  re-scan) on every launch.
+- **Runtime:** indexing is **index-in-place**, **streamed** (batched SQLite
+  commits), **cancellable**, and entirely off the UI thread; browsing lazy-loads
+  the tree and search hits the DB instead of re-reading files — so neither a large
+  index nor fast typing blocks the window.
 
 ## Requirements
 
@@ -73,21 +93,25 @@ existing metadata).
 ## Usage
 
 1. **Index** — click *Index Drive/Folder* and choose a folder or drive. Tracked
-   files (`.txt` + Office docs) are copied into the vault; indexed folders are
-   remembered and re-synced in the background on next launch.
-2. **Browse** — the left tree groups files by source folder, then category.
-   Click a `.txt` note to edit it in the **Editor** tab (edits auto-save). Office
-   files open read-only — right-click → *Open Original Location* to edit them in
-   Office.
-3. **Search** — type in the search box to filter live (`.txt` matches filename
-   *and* content; Office matches filename).
-4. **Notes** — *New Note* creates a draft; *Save Current* writes it.
-5. **Tidy up** — *Find & Remove Duplicates* removes exact-duplicate copies;
-   *Vault Report* writes a summary; *Open Reports* / *Deep Reset Reports* manage them.
+   files (`.txt` + Office docs) are catalogued **in place** (originals are not
+   moved or copied) with a live count; hit **Cancel** to stop a long scan.
+   Indexed folders are remembered and re-synced in the background on next launch.
+2. **Browse** — the left tree lazily loads by source folder → category. Click a
+   file to preview it. Use **◀ Back / Forward ▶** (or `Alt+←/→`) to retrace, and
+   **Clear** to reset the view.
+3. **Search** — type to search **inside** every indexed file (full-text) or switch
+   the dropdown to *Filename*. Results list matching files with a snippet; the box
+   is debounced. `Ctrl+F` focuses it, `Esc` / **✕** clears it.
+4. **Preview & notes** — Office and indexed `.txt` open **read-only** (large text
+   pages in via *Load more*); right-click → *Open Original Location* to edit in the
+   source app. **New Note** creates an editable note in the vault that auto-saves
+   (`Ctrl+S` to save now).
+5. **Tidy up** — *Find Duplicates* recycles exact-duplicate copies; *Report* writes
+   a summary; *Open Vault* opens the data folder.
 6. **Security tab** — review executables/scripts flagged during indexing; run a
    *Defender Scan*, or send a flagged file to the Recycle Bin.
 7. **Deep Purge tab** — select files and *Deep Delete* to remove them from the
-   vault, their original location, and the Windows RecentDocs registry. This
+   index, their original location, and the Windows RecentDocs registry. This
    action asks you to type `PURGE` to confirm.
 
 All deletions go to the Recycle Bin / Trash — see [Safety](#safety).

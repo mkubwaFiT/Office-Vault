@@ -3,6 +3,35 @@
 All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.0.0] — 2026-07-01
+
+Architecture rebuild for scale, search, and preview. **Breaking:** the data
+model moved from a copy-everything vault + `vault_metadata.json` to an
+index-in-place SQLite catalog (`vault.db`). The old JSON is imported
+automatically on first run.
+
+### Added
+- **Full-text search (SQLite FTS5)** across `.txt` *and* Office documents, with
+  highlighted result snippets and a filename/full-text toggle; `LIKE` fallback
+  when FTS5 is unavailable.
+- **OOXML text extraction** (`.docx/.xlsx/.pptx`) using only `zipfile` + `xml.etree`.
+- **Real previews:** extracted-text preview for Office; paged (*Load more*) preview
+  for large `.txt`; clear notice for legacy OLE `.doc/.xls/.ppt`.
+- **Cancellable, streaming indexer** with live progress/count and a Cancel button.
+- **Navigation/UX:** lazy-loaded tree, Back/Forward history, Clear, Clear-search,
+  keyboard shortcuts (`Ctrl+F`, `Ctrl+S`, `Esc`, `Alt+←/→`), status bar, logging
+  to `vault.log`.
+
+### Changed
+- Indexing is now **in place** (no whole-disk copying) — fixes hangs and storage
+  bloat on large drives; the O(n²) metadata lookup is gone (indexed DB queries).
+- Search is debounced and runs against the DB instead of re-reading files.
+- Refactored the ~830-line god class into `TextExtractor` / `VaultStore` /
+  `Indexer` / `VaultToolkitApp` layers; silent `except` blocks now log.
+
+### Notes
+- A packaged Windows build for v2 must be produced on Windows (`python build_vault.py`).
+
 ## [1.0.0] — 2026-06-25
 
 First public release — the harmonized successor to the separate **TextVault**

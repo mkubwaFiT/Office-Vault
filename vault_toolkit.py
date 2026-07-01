@@ -1,31 +1,49 @@
+"""
+Vault Toolkit — unified Text + Office document catalog, search and cleanup tool.
+
+Architecture (v2, layered):
+  * TextExtractor  — stdlib-only text extraction (.txt + OOXML .docx/.xlsx/.pptx).
+  * VaultStore     — SQLite catalog with FTS5 full-text search (LIKE fallback).
+  * Indexer        — cancellable, streaming, background disk scanner.
+  * VaultToolkitApp — Tkinter UI (browse / search / preview / security / purge).
+
+Design notes:
+  * Files are indexed *in place* by default (no whole-disk copying) — the vault
+    is a searchable catalog plus a home for in-app notes, not a duplicate store.
+  * Everything heavy runs off the Tk thread; the UI marshals updates via after().
+  * All deletes are recoverable (OS Recycle Bin / Trash, local fallback).
+"""
 import os
 import sys
-import shutil
 import re
 import time
 import json
-import subprocess
+import shutil
+import sqlite3
 import hashlib
+import logging
+import zipfile
 import threading
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, simpledialog
+import subprocess
+import xml.etree.ElementTree as ET
 from collections import Counter
 
-# winreg / explorer / Defender are Windows-only. Guard the import so the
-# toolkit stays importable (and the non-Windows features degrade gracefully)
-# on other platforms during development.
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, simpledialog
+
+# winreg / explorer / Defender are Windows-only.
 IS_WINDOWS = sys.platform.startswith("win")
 if IS_WINDOWS:
     import winreg
 
-# Common words to ignore when grouping .txt notes by relevance
-STOP_WORDS = set([
-    "the", "and", "to", "a", "of", "in", "it", "is", "for", "that", "on", "you",
-    "this", "with", "as", "at", "by", "not", "be", "are", "from", "but", "have",
-    "an", "which", "was", "or", "we", "can", "if", "your", "has", "will", "all"
-])
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+STOP_WORDS = set(
+    "the and to a of in it is for that on you this with as at by not be are from "
+    "but have an which was or we can if your has will all".split()
+)
 
-# Microsoft Office Extensions Mapping (binary formats: read-only in the editor)
 MS_EXTENSIONS = {
     '.doc': 'Word Documents',
     '.docx': 'Word Documents',
@@ -34,842 +52,1096 @@ MS_EXTENSIONS = {
     '.ppt': 'PowerPoint Presentations',
     '.pptx': 'PowerPoint Presentations',
 }
-
-# File types the unified vault tracks: editable .txt notes + MS Office binaries
+OOXML_EXTS = {'.docx', '.xlsx', '.pptx'}          # can be text-extracted with stdlib
+LEGACY_OLE_EXTS = {'.doc', '.xls', '.ppt'}         # pre-2007 binary — no stdlib parser
 TRACKED_EXTS = set(MS_EXTENSIONS) | {'.txt'}
-
 DANGER_EXTS = {'.exe', '.bat', '.ps1', '.vbs', '.scr', '.dll', '.js', '.wsf'}
 
+INDEX_TEXT_CAP = 1_000_000     # max chars of extracted body stored per file
+PREVIEW_CHUNK = 200_000        # bytes of a large .txt loaded per "page"
+BATCH_COMMIT = 200             # files per DB transaction while indexing
+SEARCH_LIMIT = 500            # max search results returned to the UI
 
+log = logging.getLogger("vault")
+
+
+# ===========================================================================
+# Text extraction
+# ===========================================================================
+class TextExtractor:
+    """Stdlib-only text extraction for indexing and preview."""
+
+    @staticmethod
+    def extract(path, ext, cap=INDEX_TEXT_CAP):
+        try:
+            if ext == '.txt':
+                with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                    return f.read(cap)
+            if ext == '.docx':
+                return TextExtractor._ooxml(path, cap, member='word/document.xml')
+            if ext == '.xlsx':
+                return TextExtractor._ooxml(path, cap, member='xl/sharedStrings.xml')
+            if ext == '.pptx':
+                return TextExtractor._ooxml(path, cap, member_prefix='ppt/slides/slide')
+        except Exception as e:
+            log.warning("extract failed for %s: %s", path, e)
+        return ""
+
+    @staticmethod
+    def _ooxml(path, cap, member=None, member_prefix=None):
+        """Pull all <...:t> text nodes out of one or more OOXML parts."""
+        texts, total = [], 0
+        with zipfile.ZipFile(path) as z:
+            names = z.namelist()
+            targets = ([member] if member and member in names else []) + (
+                sorted(n for n in names if member_prefix and n.startswith(member_prefix) and n.endswith('.xml'))
+            )
+            for name in targets:
+                with z.open(name) as fh:
+                    for _event, elem in ET.iterparse(fh):
+                        if elem.tag.rsplit('}', 1)[-1] == 't' and elem.text:
+                            texts.append(elem.text)
+                            total += len(elem.text)
+                        elem.clear()
+                        if total >= cap:
+                            break
+                if total >= cap:
+                    break
+        return ' '.join(texts)[:cap]
+
+    @staticmethod
+    def dominant_keyword(text):
+        words = [w for w in re.findall(r'\b[a-zA-Z]{4,}\b', text[:10000].lower()) if w not in STOP_WORDS]
+        if not words:
+            return "Uncategorized"
+        return Counter(words).most_common(1)[0][0].capitalize()
+
+
+# ===========================================================================
+# SQLite catalog + FTS5 full-text search
+# ===========================================================================
+class VaultStore:
+    def __init__(self, db_path):
+        self._lock = threading.Lock()
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        self.fts = self._detect_fts5()
+        self._init_schema()
+
+    def _detect_fts5(self):
+        try:
+            self.conn.execute("CREATE VIRTUAL TABLE temp.__fts_probe USING fts5(x)")
+            self.conn.execute("DROP TABLE temp.__fts_probe")
+            return True
+        except sqlite3.OperationalError:
+            log.warning("FTS5 unavailable — falling back to LIKE search")
+            return False
+
+    def _init_schema(self):
+        with self._lock:
+            self.conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS files (
+                    id INTEGER PRIMARY KEY,
+                    original_path TEXT UNIQUE,
+                    vault_path TEXT,
+                    filename TEXT,
+                    ext TEXT,
+                    category TEXT,
+                    source_dir TEXT,
+                    editable INTEGER DEFAULT 0,
+                    mtime REAL,
+                    size INTEGER,
+                    body TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_files_source ON files(source_dir);
+                CREATE INDEX IF NOT EXISTS idx_files_ext ON files(ext);
+                CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+                """
+            )
+            if self.fts:
+                self.conn.execute(
+                    "CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(filename, body)"
+                )
+            self.conn.commit()
+
+    # -- meta / settings -----------------------------------------------------
+    def get_meta(self, key, default=None):
+        with self._lock:
+            row = self.conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return json.loads(row["value"]) if row else default
+
+    def set_meta(self, key, value):
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO meta(key, value) VALUES(?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, json.dumps(value)),
+            )
+            self.conn.commit()
+
+    def is_empty(self):
+        with self._lock:
+            return self.conn.execute("SELECT COUNT(*) c FROM files").fetchone()["c"] == 0
+
+    def count(self):
+        with self._lock:
+            return self.conn.execute("SELECT COUNT(*) c FROM files").fetchone()["c"]
+
+    # -- writes --------------------------------------------------------------
+    def get_by_path(self, original_path):
+        with self._lock:
+            return self.conn.execute(
+                "SELECT * FROM files WHERE original_path=?", (original_path,)
+            ).fetchone()
+
+    def upsert(self, rec):
+        with self._lock:
+            self.conn.execute(
+                """INSERT INTO files
+                   (original_path, vault_path, filename, ext, category, source_dir, editable, mtime, size, body)
+                   VALUES (:original_path,:vault_path,:filename,:ext,:category,:source_dir,:editable,:mtime,:size,:body)
+                   ON CONFLICT(original_path) DO UPDATE SET
+                     vault_path=excluded.vault_path, filename=excluded.filename, ext=excluded.ext,
+                     category=excluded.category, source_dir=excluded.source_dir, editable=excluded.editable,
+                     mtime=excluded.mtime, size=excluded.size, body=excluded.body""",
+                rec,
+            )
+            fid = self.conn.execute(
+                "SELECT id FROM files WHERE original_path=?", (rec["original_path"],)
+            ).fetchone()["id"]
+            if self.fts:
+                self.conn.execute("DELETE FROM files_fts WHERE rowid=?", (fid,))
+                self.conn.execute(
+                    "INSERT INTO files_fts(rowid, filename, body) VALUES(?,?,?)",
+                    (fid, rec["filename"], rec["body"] or ""),
+                )
+            return fid
+
+    def commit(self):
+        with self._lock:
+            self.conn.commit()
+
+    def delete(self, file_id):
+        with self._lock:
+            self.conn.execute("DELETE FROM files WHERE id=?", (file_id,))
+            if self.fts:
+                self.conn.execute("DELETE FROM files_fts WHERE rowid=?", (file_id,))
+            self.conn.commit()
+
+    def get(self, file_id):
+        with self._lock:
+            return self.conn.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
+
+    # -- browse queries ------------------------------------------------------
+    def source_dirs(self):
+        with self._lock:
+            return self.conn.execute(
+                "SELECT source_dir, COUNT(*) n FROM files GROUP BY source_dir ORDER BY source_dir"
+            ).fetchall()
+
+    def categories(self, source_dir):
+        with self._lock:
+            return self.conn.execute(
+                "SELECT category, COUNT(*) n FROM files WHERE source_dir=? GROUP BY category ORDER BY category",
+                (source_dir,),
+            ).fetchall()
+
+    def files_in(self, source_dir, category):
+        with self._lock:
+            return self.conn.execute(
+                "SELECT * FROM files WHERE source_dir=? AND category=? ORDER BY filename",
+                (source_dir, category),
+            ).fetchall()
+
+    def all_files(self):
+        with self._lock:
+            return self.conn.execute("SELECT * FROM files ORDER BY filename").fetchall()
+
+    # -- search --------------------------------------------------------------
+    def search(self, query, limit=SEARCH_LIMIT):
+        query = (query or "").strip()
+        if not query:
+            return []
+        if self.fts:
+            tokens = re.findall(r"\w+", query)
+            if not tokens:
+                return []
+            match = " ".join(f"{t}*" for t in tokens)
+            try:
+                with self._lock:
+                    rows = self.conn.execute(
+                        """SELECT f.*, snippet(files_fts, 1, '«', '»', ' … ', 12) AS snippet
+                           FROM files_fts JOIN files f ON f.id = files_fts.rowid
+                           WHERE files_fts MATCH ? ORDER BY rank LIMIT ?""",
+                        (match, limit),
+                    ).fetchall()
+                return rows
+            except sqlite3.OperationalError as e:
+                log.warning("FTS query failed (%s) — using LIKE", e)
+        # LIKE fallback
+        like = f"%{query}%"
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM files WHERE filename LIKE ? OR body LIKE ? ORDER BY filename LIMIT ?",
+                (like, like, limit),
+            ).fetchall()
+        return rows
+
+    def close(self):
+        with self._lock:
+            self.conn.close()
+
+
+# ===========================================================================
+# Cancellable streaming indexer
+# ===========================================================================
+class Indexer:
+    def __init__(self, store, vault_dir, on_progress, on_done):
+        self.store = store
+        self.vault_dir = os.path.normpath(vault_dir)
+        self.on_progress = on_progress
+        self.on_done = on_done
+        self._cancel = threading.Event()
+        self._thread = None
+
+    @property
+    def running(self):
+        return self._thread is not None and self._thread.is_alive()
+
+    def start(self, target_dir, copy_to_vault=False):
+        if self.running:
+            return False
+        self._cancel.clear()
+        self._thread = threading.Thread(
+            target=self._run, args=(target_dir, copy_to_vault), daemon=True
+        )
+        self._thread.start()
+        return True
+
+    def cancel(self):
+        self._cancel.set()
+
+    def _run(self, target_dir, copy_to_vault):
+        scanned = added = 0
+        sec_flags = []
+        try:
+            for root_dir, dirs, files in os.walk(target_dir):
+                if self._cancel.is_set():
+                    break
+                if os.path.normpath(root_dir).startswith(self.vault_dir):
+                    continue
+                for name in files:
+                    if self._cancel.is_set():
+                        break
+                    ext = os.path.splitext(name)[1].lower()
+                    src = os.path.join(root_dir, name)
+                    if ext in DANGER_EXTS:
+                        sec_flags.append(("Executable/Script", src))
+                        continue
+                    if ext not in TRACKED_EXTS:
+                        continue
+                    scanned += 1
+                    try:
+                        if self._index_one(src, ext, copy_to_vault):
+                            added += 1
+                            if added % BATCH_COMMIT == 0:
+                                self.store.commit()
+                                self.on_progress(scanned, added)
+                    except Exception as e:
+                        log.warning("index failed for %s: %s", src, e)
+            self.store.commit()
+        except Exception as e:
+            log.exception("indexer crashed: %s", e)
+        finally:
+            self.on_done(scanned, added, sec_flags, self._cancel.is_set())
+
+    def _index_one(self, src, ext, copy_to_vault):
+        st = os.stat(src)
+        mtime = st.st_mtime
+        existing = self.store.get_by_path(src)
+        if existing and existing["mtime"] == mtime and existing["body"] is not None:
+            return False  # unchanged, already indexed
+
+        body = TextExtractor.extract(src, ext)
+        category = TextExtractor.dominant_keyword(body) if ext == '.txt' else MS_EXTENSIONS.get(ext, "Documents")
+
+        vault_path = None
+        if copy_to_vault:
+            vault_path = self._copy_into_vault(src)
+
+        self.store.upsert({
+            "original_path": src,
+            "vault_path": vault_path,
+            "filename": os.path.basename(src),
+            "ext": ext,
+            "category": category,
+            "source_dir": os.path.dirname(src),
+            "editable": 0,
+            "mtime": mtime,
+            "size": st.st_size,
+            "body": body,
+        })
+        return True
+
+    def _copy_into_vault(self, src):
+        dest = os.path.join(self.vault_dir, os.path.basename(src))
+        base, e = os.path.splitext(dest)
+        counter = 1
+        while os.path.exists(dest):
+            dest = f"{base}_{counter}{e}"
+            counter += 1
+        shutil.copy2(src, dest)
+        return dest
+
+
+# ===========================================================================
+# OS integration helpers (recoverable delete, reveal, registry, defender)
+# ===========================================================================
+def send_to_trash(path):
+    path = os.path.abspath(path)
+    try:
+        if IS_WINDOWS:
+            import ctypes
+            from ctypes import wintypes
+
+            class SHFILEOPSTRUCTW(ctypes.Structure):
+                _fields_ = [
+                    ("hwnd", wintypes.HWND), ("wFunc", wintypes.UINT),
+                    ("pFrom", wintypes.LPCWSTR), ("pTo", wintypes.LPCWSTR),
+                    ("fFlags", ctypes.c_uint16), ("fAnyOperationsAborted", wintypes.BOOL),
+                    ("hNameMappings", ctypes.c_void_p), ("lpszProgressTitle", wintypes.LPCWSTR),
+                ]
+            FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_SILENT, FOF_NOERRORUI = 3, 0x40, 0x10, 0x04, 0x400
+            op = SHFILEOPSTRUCTW()
+            op.wFunc = FO_DELETE
+            op.pFrom = path + "\0"
+            op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI
+            res = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
+            return res == 0 and not op.fAnyOperationsAborted
+        elif sys.platform == "darwin":
+            script = f'tell application "Finder" to delete POSIX file "{path}"'
+            return subprocess.call(["osascript", "-e", script],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0
+        else:
+            trash = os.path.join(os.path.expanduser("~"), ".local", "share", "Trash")
+            files_dir, info_dir = os.path.join(trash, "files"), os.path.join(trash, "info")
+            os.makedirs(files_dir, exist_ok=True)
+            os.makedirs(info_dir, exist_ok=True)
+            base = os.path.basename(path)
+            dest = os.path.join(files_dir, base)
+            counter = 1
+            while os.path.exists(dest):
+                dest = os.path.join(files_dir, f"{base}.{counter}")
+                counter += 1
+            with open(os.path.join(info_dir, os.path.basename(dest) + ".trashinfo"), "w") as f:
+                f.write(f"[Trash Info]\nPath={path}\nDeletionDate={time.strftime('%Y-%m-%dT%H:%M:%S')}\n")
+            shutil.move(path, dest)
+            return True
+    except Exception as e:
+        log.warning("trash failed for %s: %s", path, e)
+        return False
+
+
+def safe_delete(path, fallback_dir):
+    """Recoverable delete: OS trash, else relocate to fallback_dir. Never hard-removes."""
+    if not path or not os.path.exists(path):
+        return True
+    if send_to_trash(path):
+        return True
+    try:
+        os.makedirs(fallback_dir, exist_ok=True)
+        dest = os.path.join(fallback_dir, f"{int(time.time())}_{os.path.basename(path)}")
+        counter = 1
+        while os.path.exists(dest):
+            dest = os.path.join(fallback_dir, f"{int(time.time())}_{counter}_{os.path.basename(path)}")
+            counter += 1
+        shutil.move(path, dest)
+        return True
+    except Exception as e:
+        log.warning("safe_delete fallback failed for %s: %s", path, e)
+        return False
+
+
+def reveal_in_file_manager(path, select=False):
+    path = os.path.normpath(path)
+    try:
+        if IS_WINDOWS:
+            subprocess.Popen(f'explorer /select,"{path}"' if select else f'explorer "{path}"')
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", "-R", path] if select else ["open", path])
+        else:
+            subprocess.Popen(["xdg-open", os.path.dirname(path) if select else path])
+    except Exception as e:
+        messagebox.showerror("Error", f"Failed to open location:\n{e}")
+
+
+def purge_registry_mru(target_filename):
+    if not IS_WINDOWS:
+        return
+    try:
+        mru = r"Software\Microsoft\Windows\CurrentVersion\Explorer\RecentDocs"
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, mru, 0, winreg.KEY_READ | winreg.KEY_WRITE)
+        to_delete = []
+        for i in range(winreg.QueryInfoKey(key)[1]):
+            try:
+                name, data, _ = winreg.EnumValue(key, i)
+                if isinstance(data, bytes) and target_filename.lower() in data.decode('utf-16le', 'ignore').lower():
+                    to_delete.append(name)
+            except Exception:
+                continue
+        for v in to_delete:
+            winreg.DeleteValue(key, v)
+        winreg.CloseKey(key)
+    except Exception as e:
+        log.info("registry MRU purge skipped: %s", e)
+
+
+def hash_file(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(65536), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+# ===========================================================================
+# Tkinter UI
+# ===========================================================================
 class VaultToolkitApp:
+    NOTES_LABEL = "My Notes (Vault)"
+
     def __init__(self, root):
         self.root = root
-        self.root.title("Vault Toolkit (Text + Office) - Assembler: KIMANI S.M.")
-        self.root.geometry("1100x700")
+        self.root.title("Vault Toolkit v2 (Text + Office) - Assembler: KIMANI S.M.")
+        self.root.geometry("1180x740")
 
-        # Setup Vault Directory
         self.vault_dir = os.path.join(os.path.expanduser("~"), "TextVault_Data")
-        if not os.path.exists(self.vault_dir):
-            os.makedirs(self.vault_dir)
+        self.notes_dir = os.path.join(self.vault_dir, "Notes")
+        self.trash_dir = os.path.join(self.vault_dir, "_RecycleBin")
+        os.makedirs(self.notes_dir, exist_ok=True)
 
-        # Caching and metadata memory
-        self.metadata_file = os.path.join(self.vault_dir, "vault_metadata.json")
-        self.metadata = self.load_metadata()
-        self.file_cache = {}
-        self.indexed_folders = self.metadata.get("indexed_folders", [])
+        self._init_logging()
+        self.store = VaultStore(os.path.join(self.vault_dir, "vault.db"))
+        self._migrate_legacy_json()
 
-        self.current_file = None
-        self.file_index = {}
+        self.indexed_folders = self.store.get_meta("indexed_folders", [])
+        self.indexer = Indexer(self.store, self.vault_dir,
+                               on_progress=self._progress_cb, on_done=self._done_cb)
 
-        # State for debouncing, security and thread-safe indexing
+        # UI/runtime state
+        self.current = None            # current file sqlite Row (or None)
+        self.item_meta = {}            # tree item id -> ('file', id) | ('src', dir) | ('cat', dir, cat)
+        self.loaded_nodes = set()      # lazily-populated node ids
+        self.history = []              # navigation stack of file ids
+        self.hist_pos = -1
+        self._navigating = False
+        self._search_timer = None
         self._autosave_timer = None
-        self.suspicious_files = []
-        self._meta_lock = threading.Lock()
+        self._preview_path = None
+        self._preview_offset = 0
 
         self.setup_ui()
+        self.populate_browse()
+        self.root.after(200, self.auto_recall_indexed)
 
-        # Paint the window first, then re-sync indexed folders in the
-        # background so startup is instant even when whole drives are indexed.
-        self.refresh_index()
-        self.refresh_purge_list()
-        self.root.after(150, self.auto_recall_indexed)
+    def _init_logging(self):
+        logging.basicConfig(
+            filename=os.path.join(self.vault_dir, "vault.log"),
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(message)s",
+        )
 
-    def load_metadata(self):
-        if os.path.exists(self.metadata_file):
-            try:
-                with open(self.metadata_file, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except Exception:
-                pass
-        return {"files": {}, "indexed_folders": []}
+    def _migrate_legacy_json(self):
+        legacy = os.path.join(self.vault_dir, "vault_metadata.json")
+        if not self.store.is_empty() or not os.path.exists(legacy):
+            return
+        try:
+            with open(legacy, encoding="utf-8") as f:
+                data = json.load(f)
+            self.store.set_meta("indexed_folders", data.get("indexed_folders", []))
+            for _vname, meta in data.get("files", {}).items():
+                op = meta.get("original_path")
+                if not op:
+                    continue
+                ext = os.path.splitext(op)[1].lower()
+                self.store.upsert({
+                    "original_path": op, "vault_path": None,
+                    "filename": os.path.basename(op), "ext": ext,
+                    "category": MS_EXTENSIONS.get(ext, "Uncategorized"),
+                    "source_dir": os.path.dirname(op), "editable": 0,
+                    "mtime": meta.get("mtime", 0), "size": 0, "body": None,
+                })
+            self.store.commit()
+            log.info("migrated %d legacy entries", len(data.get("files", {})))
+        except Exception as e:
+            log.warning("legacy migration skipped: %s", e)
 
-    def save_metadata(self):
-        self.metadata["indexed_folders"] = self.indexed_folders
-        with open(self.metadata_file, 'w', encoding='utf-8') as f:
-            json.dump(self.metadata, f, indent=4)
-
+    # -- UI construction -----------------------------------------------------
     def setup_ui(self):
-        toolbar = tk.Frame(self.root, bd=1, relief=tk.RAISED)
-        toolbar.pack(side=tk.TOP, fill=tk.X)
+        tb = tk.Frame(self.root, bd=1, relief=tk.RAISED)
+        tb.pack(side=tk.TOP, fill=tk.X)
 
-        tk.Button(toolbar, text="Index Drive/Folder", command=self.index_folder).pack(side=tk.LEFT, padx=2, pady=2)
-        tk.Button(toolbar, text="New Note", command=self.new_note).pack(side=tk.LEFT, padx=2, pady=2)
-        tk.Button(toolbar, text="Save Current", command=self.save_current).pack(side=tk.LEFT, padx=2, pady=2)
+        def btn(parent, text, cmd, side=tk.LEFT):
+            b = tk.Button(parent, text=text, command=cmd)
+            b.pack(side=side, padx=2, pady=2)
+            return b
 
-        tk.Button(toolbar, text="Find & Remove Duplicates", command=self.find_duplicates).pack(side=tk.LEFT, padx=2, pady=2)
-        tk.Button(toolbar, text="Vault Report (日本語)", command=self.generate_japanese_report).pack(side=tk.LEFT, padx=2, pady=2)
+        btn(tb, "Index Drive/Folder", self.index_folder)
+        self.btn_cancel = btn(tb, "Cancel", self.cancel_index)
+        self.btn_cancel.config(state=tk.DISABLED)
+        btn(tb, "New Note", self.new_note)
+        self.btn_save = btn(tb, "Save", self.save_current)
+        btn(tb, "Clear", self.clear_view)
+        self.btn_back = btn(tb, "◀ Back", self.go_back)
+        self.btn_fwd = btn(tb, "Forward ▶", self.go_forward)
+        btn(tb, "Find Duplicates", self.find_duplicates)
+        btn(tb, "Report", self.generate_report)
+        btn(tb, "Open Vault", lambda: reveal_in_file_manager(self.vault_dir))
 
-        tk.Button(toolbar, text="Open Reports", command=self.open_report_location).pack(side=tk.LEFT, padx=2, pady=2)
-        tk.Button(toolbar, text="Deep Reset Reports", command=self.deep_reset_reports).pack(side=tk.LEFT, padx=2, pady=2)
-
-        # Status label (right of toolbar) for non-blocking background indexing
-        self.status_var = tk.StringVar(value="Ready")
-        tk.Label(toolbar, textvariable=self.status_var, anchor="e").pack(side=tk.RIGHT, padx=8)
-
-        search_frame = tk.Frame(toolbar)
-        search_frame.pack(side=tk.RIGHT, padx=5)
-        tk.Label(search_frame, text="Search:").pack(side=tk.LEFT)
+        # Search (right side): mode + entry + clear
+        sf = tk.Frame(tb)
+        sf.pack(side=tk.RIGHT, padx=5)
+        self.search_mode = tk.StringVar(value="Full-text")
+        ttk.Combobox(sf, textvariable=self.search_mode, values=["Full-text", "Filename"],
+                     width=9, state="readonly").pack(side=tk.LEFT, padx=(0, 4))
         self.search_var = tk.StringVar()
-        self.search_var.trace("w", self.on_search)
-        tk.Entry(search_frame, textvariable=self.search_var, width=30).pack(side=tk.LEFT)
+        self.search_var.trace("w", self.on_search_changed)
+        tk.Entry(sf, textvariable=self.search_var, width=28).pack(side=tk.LEFT)
+        tk.Button(sf, text="✕", command=self.clear_search).pack(side=tk.LEFT, padx=(2, 0))
 
-        self.paned_window = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
-        self.paned_window.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        # Status + progress bar row
+        sb = tk.Frame(self.root)
+        sb.pack(side=tk.BOTTOM, fill=tk.X)
+        self.status_var = tk.StringVar(value="Ready")
+        tk.Label(sb, textvariable=self.status_var, anchor="w").pack(side=tk.LEFT, padx=6)
+        self.progress = ttk.Progressbar(sb, mode="indeterminate", length=180)
+        self.progress.pack(side=tk.RIGHT, padx=6, pady=2)
 
-        # Left Pane: File Tree
-        left_frame = tk.Frame(self.paned_window)
-        tree_y_scroll = ttk.Scrollbar(left_frame, orient="vertical")
-        tree_x_scroll = ttk.Scrollbar(left_frame, orient="horizontal")
+        # Main split
+        self.paned = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
+        self.paned.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        self.tree = ttk.Treeview(left_frame, yscrollcommand=tree_y_scroll.set, xscrollcommand=tree_x_scroll.set, selectmode="extended")
-
-        tree_y_scroll.config(command=self.tree.yview)
-        tree_x_scroll.config(command=self.tree.xview)
-
-        tree_y_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        tree_x_scroll.pack(side=tk.BOTTOM, fill=tk.X)
+        left = tk.Frame(self.paned)
+        ys = ttk.Scrollbar(left, orient="vertical")
+        self.tree = ttk.Treeview(left, yscrollcommand=ys.set, selectmode="extended")
+        ys.config(command=self.tree.yview)
+        ys.pack(side=tk.RIGHT, fill=tk.Y)
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self.tree.bind('<<TreeviewSelect>>', self.on_file_select)
-
-        self.tree_menu = tk.Menu(self.root, tearoff=0)
-        self.tree_menu.add_command(label="Delete Selected File(s)", command=self.delete_file)
-        self.tree_menu.add_command(label="Open Original Location", command=self.open_original_location)
+        self.tree.bind('<<TreeviewSelect>>', self.on_tree_select)
+        self.tree.bind('<<TreeviewOpen>>', self.on_tree_open)
         self.tree.bind("<Button-3>", self.show_tree_menu)
+        self.tree_menu = tk.Menu(self.root, tearoff=0)
+        self.tree_menu.add_command(label="Open Original Location", command=self.open_original_location)
+        self.tree_menu.add_command(label="Remove from Index", command=self.remove_from_index)
+        self.paned.add(left, weight=1)
 
-        self.paned_window.add(left_frame, weight=1)
+        self.notebook = ttk.Notebook(self.paned)
+        self.paned.add(self.notebook, weight=3)
+        self._build_viewer_tab()
+        self._build_security_tab()
+        self._build_purge_tab()
 
-        # Right Pane Notebook
-        self.right_notebook = ttk.Notebook(self.paned_window)
-        self.paned_window.add(self.right_notebook, weight=3)
+        # Shortcuts
+        self.root.bind("<Control-f>", lambda e: self._focus_search())
+        self.root.bind("<Control-s>", lambda e: self.save_current())
+        self.root.bind("<Escape>", lambda e: self.clear_search())
+        self.root.bind("<Alt-Left>", lambda e: self.go_back())
+        self.root.bind("<Alt-Right>", lambda e: self.go_forward())
+        self._update_nav_buttons()
 
-        editor_frame = tk.Frame(self.right_notebook)
-        self.right_notebook.add(editor_frame, text="Editor")
+    def _build_viewer_tab(self):
+        frame = tk.Frame(self.notebook)
+        self.notebook.add(frame, text="Viewer")
+        self.viewer_info = tk.StringVar(value="Select a file to preview.")
+        tk.Label(frame, textvariable=self.viewer_info, anchor="w", fg="#3a5").pack(fill=tk.X, padx=4, pady=2)
+        body = tk.Frame(frame)
+        body.pack(fill=tk.BOTH, expand=True)
+        ys = ttk.Scrollbar(body, orient="vertical")
+        self.text = tk.Text(body, wrap=tk.WORD, font=("Consolas", 11), yscrollcommand=ys.set, undo=True)
+        ys.config(command=self.text.yview)
+        ys.pack(side=tk.RIGHT, fill=tk.Y)
+        self.text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.text.bind("<KeyRelease>", self.on_edit)
+        self.load_more_btn = tk.Button(frame, text="Load more ▼", command=self.load_more_preview)
+        # packed only when a large .txt is truncated
 
-        text_y_scroll = ttk.Scrollbar(editor_frame, orient="vertical")
-        text_x_scroll = ttk.Scrollbar(editor_frame, orient="horizontal")
-
-        self.text_editor = tk.Text(editor_frame, wrap=tk.NONE, font=("Consolas", 11),
-                                   yscrollcommand=text_y_scroll.set, xscrollcommand=text_x_scroll.set, undo=True)
-
-        text_y_scroll.config(command=self.text_editor.yview)
-        text_x_scroll.config(command=self.text_editor.xview)
-
-        text_y_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        text_x_scroll.pack(side=tk.BOTTOM, fill=tk.X)
-        self.text_editor.pack(fill=tk.BOTH, expand=True)
-        self.text_editor.bind("<KeyRelease>", self.auto_save_draft)
-
-        self.editor_menu = tk.Menu(self.root, tearoff=0)
-        self.editor_menu.add_command(label="Copy", command=lambda: self.text_editor.event_generate("<<Copy>>"))
-        self.editor_menu.add_command(label="Cut", command=lambda: self.text_editor.event_generate("<<Cut>>"))
-        self.editor_menu.add_command(label="Paste", command=lambda: self.text_editor.event_generate("<<Paste>>"))
-        self.editor_menu.add_separator()
-        self.editor_menu.add_command(label="Undo", command=lambda: self.text_editor.event_generate("<<Undo>>"))
-        self.editor_menu.add_command(label="Redo", command=lambda: self.text_editor.event_generate("<<Redo>>"))
-        self.text_editor.bind("<Button-3>", self.show_editor_menu)
-
-        # Security Scanner UI Tab
-        self.security_frame = tk.Frame(self.right_notebook)
-        self.right_notebook.add(self.security_frame, text="Security & Irrelevant Scan")
-
-        sec_toolbar = tk.Frame(self.security_frame)
-        sec_toolbar.pack(fill=tk.X, pady=5)
-        tk.Button(sec_toolbar, text="Clear List", command=self.clear_security_list).pack(side=tk.LEFT)
-        tk.Button(sec_toolbar, text="Run Defender Scan on Selected", command=self.run_defender_scan).pack(side=tk.LEFT, padx=5)
-        tk.Button(sec_toolbar, text="Delete Selected File", command=self.delete_security_file).pack(side=tk.LEFT)
-
-        self.scan_progress = ttk.Progressbar(sec_toolbar, mode='indeterminate', length=200)
-        self.scan_progress.pack(side=tk.LEFT, padx=10)
-
-        self.sec_tree = ttk.Treeview(self.security_frame, columns=("Type", "Path"), show="headings", selectmode="extended")
+    def _build_security_tab(self):
+        frame = tk.Frame(self.notebook)
+        self.notebook.add(frame, text="Security & Irrelevant Scan")
+        bar = tk.Frame(frame)
+        bar.pack(fill=tk.X, pady=5)
+        tk.Button(bar, text="Clear List", command=lambda: self.sec_tree.delete(*self.sec_tree.get_children())).pack(side=tk.LEFT)
+        tk.Button(bar, text="Run Defender Scan on Selected", command=self.run_defender_scan).pack(side=tk.LEFT, padx=5)
+        tk.Button(bar, text="Delete Selected File", command=self.delete_security_file).pack(side=tk.LEFT)
+        self.sec_progress = ttk.Progressbar(bar, mode='indeterminate', length=180)
+        self.sec_progress.pack(side=tk.LEFT, padx=10)
+        self.sec_tree = ttk.Treeview(frame, columns=("Type", "Path"), show="headings", selectmode="extended")
         self.sec_tree.heading("Type", text="Flag Type")
         self.sec_tree.heading("Path", text="Original File Path")
-        self.sec_tree.column("Type", width=100)
-        self.sec_tree.column("Path", width=500)
+        self.sec_tree.column("Type", width=110)
+        self.sec_tree.column("Path", width=560)
         self.sec_tree.pack(fill=tk.BOTH, expand=True)
 
-        # Deep Purge & Registry Scan Tab
-        self.deep_purge_frame = tk.Frame(self.right_notebook)
-        self.right_notebook.add(self.deep_purge_frame, text="Deep Purge & Registry")
-
-        purge_toolbar = tk.Frame(self.deep_purge_frame)
-        purge_toolbar.pack(fill=tk.X, pady=5)
-        tk.Button(purge_toolbar, text="Refresh Indexed List", command=self.refresh_purge_list).pack(side=tk.LEFT, padx=5)
-        tk.Button(purge_toolbar, text="Deep Delete Selected (Files + Registry)", command=self.execute_deep_purge).pack(side=tk.LEFT)
-
-        self.purge_tree = ttk.Treeview(self.deep_purge_frame, columns=("File", "Vault Path", "Original Path"), show="headings", selectmode="extended")
+    def _build_purge_tab(self):
+        frame = tk.Frame(self.notebook)
+        self.notebook.add(frame, text="Deep Purge & Registry")
+        bar = tk.Frame(frame)
+        bar.pack(fill=tk.X, pady=5)
+        tk.Button(bar, text="Refresh List", command=self.refresh_purge_list).pack(side=tk.LEFT, padx=5)
+        tk.Button(bar, text="Deep Delete Selected (Files + Registry)", command=self.execute_deep_purge).pack(side=tk.LEFT)
+        self.purge_tree = ttk.Treeview(frame, columns=("File", "Original Path"), show="headings", selectmode="extended")
         self.purge_tree.heading("File", text="File Name")
-        self.purge_tree.heading("Vault Path", text="Vault Path")
         self.purge_tree.heading("Original Path", text="Original Path")
-        self.purge_tree.column("File", width=150)
-        self.purge_tree.column("Vault Path", width=250)
-        self.purge_tree.column("Original Path", width=250)
+        self.purge_tree.column("File", width=200)
+        self.purge_tree.column("Original Path", width=520)
         self.purge_tree.pack(fill=tk.BOTH, expand=True)
         self.purge_tree.bind("<Visibility>", lambda e: self.refresh_purge_list())
 
-    def show_tree_menu(self, event):
-        item = self.tree.identify_row(event.y)
-        if item:
-            if item not in self.tree.selection():
-                self.tree.selection_set(item)
-            self.tree_menu.tk_popup(event.x_root, event.y_root)
-
-    def show_editor_menu(self, event):
-        self.editor_menu.tk_popup(event.x_root, event.y_root)
-
-    def delete_file(self):
-        selections = self.tree.selection()
-        if not selections:
-            return
-
-        if messagebox.askyesno("Delete", f"Are you sure you want to delete {len(selections)} selected file(s) from the Vault?"):
-            deleted_count = 0
-            for item_id in selections:
-                if item_id in self.file_index:
-                    filepath = self.file_index[item_id]
-                    filename = os.path.basename(filepath)
-                    try:
-                        if os.path.exists(filepath):
-                            self._safe_delete(filepath)
-                        if filename in self.metadata["files"]:
-                            del self.metadata["files"][filename]
-                        if filepath in self.file_cache:
-                            del self.file_cache[filepath]
-
-                        if self.current_file == filepath:
-                            self.text_editor.config(state=tk.NORMAL)
-                            self.text_editor.delete(1.0, tk.END)
-                            self.current_file = None
-                        deleted_count += 1
-                    except Exception as e:
-                        print(f"Failed to delete {filename}: {e}")
-            self.save_metadata()
-            self.refresh_index(self.search_var.get())
-            if deleted_count > 0:
-                messagebox.showinfo("Success", f"Deleted {deleted_count} file(s).")
-
-    def open_original_location(self):
-        selected = self.tree.selection()
-        if not selected:
-            return
-        item_id = selected[0]
-        if item_id in self.file_index:
-            filepath = self.file_index[item_id]
-            filename = os.path.basename(filepath)
-            file_meta = self.metadata["files"].get(filename)
-
-            if file_meta and "original_path" in file_meta:
-                orig_path = file_meta["original_path"]
-                if os.path.exists(orig_path):
-                    self._reveal_in_file_manager(orig_path, select=True)
-                else:
-                    messagebox.showwarning("Not Found", "The original file no longer exists at its source location.")
-            else:
-                messagebox.showinfo("Info", "This file was created in the Vault or its original location is unknown.")
-
-    def open_report_location(self):
-        try:
-            self._reveal_in_file_manager(self.vault_dir, select=False)
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to open location:\n{e}")
-
-    def _reveal_in_file_manager(self, path, select=False):
-        """Open the OS file manager at (or selecting) a path. Cross-platform."""
-        path = os.path.normpath(path)
-        try:
-            if IS_WINDOWS:
-                if select:
-                    subprocess.Popen(f'explorer /select,"{path}"')
-                else:
-                    subprocess.Popen(f'explorer "{path}"')
-            elif sys.platform == "darwin":
-                args = ["open", "-R", path] if select else ["open", path]
-                subprocess.Popen(args)
-            else:
-                target = os.path.dirname(path) if select else path
-                subprocess.Popen(["xdg-open", target])
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to open location:\n{e}")
-
-    # ------------------------------------------------------------------
-    # Recoverable deletion: route everything through the OS Recycle Bin /
-    # Trash so an accidental click is never an irreversible wipe. Falls back
-    # to a local _RecycleBin folder; NEVER does a hard os.remove() of data.
-    # Dependency-free (stdlib + ctypes on Windows).
-    # ------------------------------------------------------------------
-    def _safe_delete(self, path):
-        """Move `path` to the OS trash; on failure, to ~/TextVault_Data/_RecycleBin.
-        Returns True if the file is no longer at its original location."""
-        if not path or not os.path.exists(path):
-            return True
-        if self._send_to_trash(path):
-            return True
-        # Safety net: relocate into a local recycle bin rather than deleting.
-        try:
-            backup_dir = os.path.join(self.vault_dir, "_RecycleBin")
-            os.makedirs(backup_dir, exist_ok=True)
-            dest = os.path.join(backup_dir, f"{int(time.time())}_{os.path.basename(path)}")
-            counter = 1
-            while os.path.exists(dest):
-                dest = os.path.join(backup_dir, f"{int(time.time())}_{counter}_{os.path.basename(path)}")
-                counter += 1
-            shutil.move(path, dest)
-            return True
-        except Exception as e:
-            print(f"Safe-delete fallback failed for {path}: {e}")
-            return False
-
-    def _send_to_trash(self, path):
-        """Best-effort move to the OS Recycle Bin / Trash. Returns True on success."""
-        path = os.path.abspath(path)
-        try:
-            if IS_WINDOWS:
-                import ctypes
-                from ctypes import wintypes
-
-                FO_DELETE = 3
-                FOF_ALLOWUNDO = 0x0040       # send to Recycle Bin instead of deleting
-                FOF_NOCONFIRMATION = 0x0010  # we already confirmed in the UI
-                FOF_SILENT = 0x0004
-                FOF_NOERRORUI = 0x0400
-
-                class SHFILEOPSTRUCTW(ctypes.Structure):
-                    _fields_ = [
-                        ("hwnd", wintypes.HWND),
-                        ("wFunc", wintypes.UINT),
-                        ("pFrom", wintypes.LPCWSTR),
-                        ("pTo", wintypes.LPCWSTR),
-                        ("fFlags", ctypes.c_uint16),
-                        ("fAnyOperationsAborted", wintypes.BOOL),
-                        ("hNameMappings", ctypes.c_void_p),
-                        ("lpszProgressTitle", wintypes.LPCWSTR),
-                    ]
-
-                op = SHFILEOPSTRUCTW()
-                op.wFunc = FO_DELETE
-                op.pFrom = path + "\0"  # path list must be double-null terminated
-                op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI
-                res = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
-                return res == 0 and not op.fAnyOperationsAborted
-
-            elif sys.platform == "darwin":
-                # Hand off to Finder so it lands in the user's Trash properly.
-                script = f'tell application "Finder" to delete POSIX file "{path}"'
-                return subprocess.call(
-                    ["osascript", "-e", script],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                ) == 0
-
-            else:
-                # Freedesktop trash spec (~/.local/share/Trash)
-                trash = os.path.join(os.path.expanduser("~"), ".local", "share", "Trash")
-                files_dir = os.path.join(trash, "files")
-                info_dir = os.path.join(trash, "info")
-                os.makedirs(files_dir, exist_ok=True)
-                os.makedirs(info_dir, exist_ok=True)
-                base = os.path.basename(path)
-                dest = os.path.join(files_dir, base)
-                counter = 1
-                while os.path.exists(dest):
-                    dest = os.path.join(files_dir, f"{base}.{counter}")
-                    counter += 1
-                with open(os.path.join(info_dir, os.path.basename(dest) + ".trashinfo"), "w") as f:
-                    f.write(f"[Trash Info]\nPath={path}\nDeletionDate={time.strftime('%Y-%m-%dT%H:%M:%S')}\n")
-                shutil.move(path, dest)
-                return True
-        except Exception as e:
-            print(f"Trash failed for {path}: {e}")
-            return False
-
-    def deep_reset_reports(self):
-        if not messagebox.askyesno("Reset Reports", "Are you sure you want to permanently delete all generated Vault Reports?"):
-            return
-
-        deleted_count = 0
-        for filename in os.listdir(self.vault_dir):
-            if filename.startswith("Vault_Report_") and filename.endswith(".txt"):
-                filepath = os.path.join(self.vault_dir, filename)
-                try:
-                    self._safe_delete(filepath)
-                    deleted_count += 1
-                    if filename in self.metadata["files"]:
-                        del self.metadata["files"][filename]
-                    if filepath in self.file_cache:
-                        del self.file_cache[filepath]
-                except Exception as e:
-                    print(f"Error removing {filename}: {e}")
-
-        self.save_metadata()
-        self.refresh_index()
-        messagebox.showinfo("Reset Complete", f"Successfully deleted {deleted_count} report(s).")
-
-    def extract_dominant_keyword(self, content):
-        words = re.findall(r'\b[a-zA-Z]{4,}\b', content[:10000].lower())
-        filtered_words = [w for w in words if w not in STOP_WORDS]
-        if not filtered_words:
-            return "Uncategorized"
-        counter = Counter(filtered_words)
-        return counter.most_common(1)[0][0].capitalize()
-
-    # ------------------------------------------------------------------
-    # Indexing (background-threaded so the UI never blocks on os.walk)
-    # ------------------------------------------------------------------
-    def auto_recall_indexed(self):
-        for folder in list(self.indexed_folders):
-            if os.path.exists(folder):
-                self._start_index_worker(folder, silent=True)
-
-    def index_folder(self, target_dir=None, silent=False):
-        if not target_dir:
-            target_dir = filedialog.askdirectory(title="Select Drive or Folder to Index")
-        if not target_dir:
-            return
-
-        if target_dir not in self.indexed_folders:
-            self.indexed_folders.append(target_dir)
-            self.save_metadata()
-
-        self._start_index_worker(target_dir, silent=silent)
-
-    def _start_index_worker(self, target_dir, silent):
-        self.status_var.set(f"Indexing: {target_dir} ...")
-        threading.Thread(target=self._index_worker, args=(target_dir, silent), daemon=True).start()
-
-    def _index_worker(self, target_dir, silent):
-        """Runs off the Tk thread. Does filesystem work only, then marshals
-        all UI updates back to the main thread via root.after()."""
-        try:
-            found_count, sec_flags = self._scan_and_copy(target_dir)
-        except Exception as e:
-            self.root.after(0, lambda: self.status_var.set(f"Index error: {e}"))
-            return
-        self.root.after(0, lambda: self._index_done(found_count, sec_flags, silent))
-
-    def _scan_and_copy(self, target_dir):
-        """Filesystem-only scan + copy. Returns (found_count, [(flag_type, path), ...])."""
-        found_count = 0
-        sec_flags = []
-
-        with self._meta_lock:
-            for root_dir, dirs, files in os.walk(target_dir):
-                # Skip the vault itself to avoid re-indexing our own copies
-                if os.path.normpath(root_dir).startswith(os.path.normpath(self.vault_dir)):
-                    continue
-
-                for file in files:
-                    source_path = os.path.join(root_dir, file)
-                    ext = os.path.splitext(file)[1].lower()
-
-                    if ext in DANGER_EXTS:
-                        sec_flags.append(("Executable/Script", source_path))
-                        continue
-
-                    if ext not in TRACKED_EXTS:
-                        continue
-
-                    try:
-                        mtime = os.stat(source_path).st_mtime
-
-                        existing_vault_name = None
-                        for v_name, data in self.metadata["files"].items():
-                            if data.get("original_path") == source_path:
-                                existing_vault_name = v_name
-                                break
-
-                        if existing_vault_name:
-                            dest_path = os.path.join(self.vault_dir, existing_vault_name)
-                            if os.path.exists(dest_path) and \
-                               self.metadata["files"][existing_vault_name].get("mtime") == mtime:
-                                continue  # unchanged, skip the copy
-                        else:
-                            dest_path = os.path.join(self.vault_dir, file)
-                            counter = 1
-                            while os.path.exists(dest_path):
-                                name, e = os.path.splitext(file)
-                                dest_path = os.path.join(self.vault_dir, f"{name}_{counter}{e}")
-                                counter += 1
-
-                        shutil.copy2(source_path, dest_path)
-                        filename = os.path.basename(dest_path)
-                        self.metadata["files"][filename] = {
-                            "original_path": source_path,
-                            "mtime": mtime,
-                        }
-                        found_count += 1
-                    except Exception:
-                        continue
-
-            self.save_metadata()
-
-        return found_count, sec_flags
-
-    def _index_done(self, found_count, sec_flags, silent):
-        for flag_type, path in sec_flags:
-            self.sec_tree.insert("", "end", values=(flag_type, path))
-        self.refresh_index(self.search_var.get())
-        self.refresh_purge_list()
-        self.status_var.set("Ready")
-        if not silent:
-            msg = f"Synced {found_count} new or modified file(s) (.txt + Office)."
-            if sec_flags:
-                msg += f"\nFlagged {len(sec_flags)} potentially dangerous/irrelevant files. Check Security tab."
-            messagebox.showinfo("Indexing Complete", msg)
-
-    # ------------------------------------------------------------------
-    def refresh_index(self, search_query=""):
+    # -- browse tree (lazy) --------------------------------------------------
+    def populate_browse(self):
         self.tree.delete(*self.tree.get_children())
-        self.file_index.clear()
+        self.item_meta.clear()
+        self.loaded_nodes.clear()
+        for row in self.store.source_dirs():
+            label = self.NOTES_LABEL if row["source_dir"] == self.notes_dir else row["source_dir"]
+            node = self.tree.insert("", "end", text=f"{label}  ({row['n']})", open=False)
+            self.item_meta[node] = ("src", row["source_dir"])
+            self.tree.insert(node, "end", text="…")  # lazy placeholder
+        self.status_var.set(f"Ready — {self.store.count()} files indexed")
 
-        groups = {}
-        search_query = search_query.lower()
-
-        for filename in os.listdir(self.vault_dir):
-            ext = os.path.splitext(filename)[1].lower()
-            if ext not in TRACKED_EXTS:
-                continue
-
-            filepath = os.path.join(self.vault_dir, filename)
-            content = ""  # only loaded for editable .txt
-
-            try:
-                mtime = os.path.getmtime(filepath)
-                if ext in MS_EXTENSIONS:
-                    # Binary Office file: categorize by type, never read content
-                    category = MS_EXTENSIONS[ext]
-                    self.file_cache[filepath] = {'mtime': mtime, 'category': category}
-                else:
-                    # .txt note: cache content + keyword categorization
-                    cached = self.file_cache.get(filepath)
-                    if cached and cached.get('mtime') == mtime and 'content' in cached:
-                        content = cached['content']
-                        category = cached['category']
-                    else:
-                        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-                            content = f.read()
-                        category = self.extract_dominant_keyword(content)
-                        self.file_cache[filepath] = {'content': content, 'mtime': mtime, 'category': category}
-            except Exception:
-                continue
-
-            if search_query:
-                # MS files match on filename only; .txt also matches on content
-                if search_query not in filename.lower() and search_query not in content.lower():
-                    continue
-
-            original_path = self.metadata["files"].get(filename, {}).get("original_path", "Vault Local")
-            source_dir = os.path.dirname(original_path) if original_path != "Vault Local" else "Vault Local"
-
-            groups.setdefault(source_dir, {}).setdefault(category, []).append((filename, filepath))
-
-        for source_dir, categories in sorted(groups.items()):
-            source_id = self.tree.insert("", "end", text=f"Source: {source_dir}", open=False)
-            for category, files in sorted(categories.items()):
-                cat_id = self.tree.insert(source_id, "end", text=f"{category} ({len(files)})", open=False)
-                for filename, filepath in sorted(files, key=lambda x: x[0]):
-                    item_id = self.tree.insert(cat_id, "end", text=f"{filename}")
-                    self.file_index[item_id] = filepath
-
-    def on_search(self, *args):
-        self.refresh_index(self.search_var.get())
-
-    def on_file_select(self, event):
-        selected = self.tree.selection()
-        if not selected:
+    def on_tree_open(self, _event):
+        node = self.tree.focus()
+        if node in self.loaded_nodes or node not in self.item_meta:
             return
-        item_id = selected[0]
-        if item_id in self.file_index:
-            filepath = self.file_index[item_id]
-            self.current_file = filepath
-            self.load_file_to_editor(filepath)
+        kind = self.item_meta[node]
+        self.tree.delete(*self.tree.get_children(node))  # drop placeholder
+        if kind[0] == "src":
+            for row in self.store.categories(kind[1]):
+                cat = self.tree.insert(node, "end", text=f"{row['category']}  ({row['n']})", open=False)
+                self.item_meta[cat] = ("cat", kind[1], row["category"])
+                self.tree.insert(cat, "end", text="…")
+        elif kind[0] == "cat":
+            for f in self.store.files_in(kind[1], kind[2]):
+                leaf = self.tree.insert(node, "end", text=f["filename"])
+                self.item_meta[leaf] = ("file", f["id"])
+        self.loaded_nodes.add(node)
 
-    def load_file_to_editor(self, filepath):
-        self.text_editor.config(state=tk.NORMAL)
-        self.text_editor.delete(1.0, tk.END)
+    # -- search --------------------------------------------------------------
+    def on_search_changed(self, *_):
+        if self._search_timer:
+            self.root.after_cancel(self._search_timer)
+        self._search_timer = self.root.after(300, self.run_search)  # debounce
 
-        ext = os.path.splitext(filepath)[1].lower()
-        if ext in MS_EXTENSIONS:
-            self.text_editor.insert(
-                tk.END,
-                "--- Binary Microsoft Office File ---\n\n"
-                f"File: {os.path.basename(filepath)}\n"
-                f"Type: {MS_EXTENSIONS[ext]}\n\n"
-                "Direct text editing is disabled for this file type to prevent corruption.\n"
-                "Please use 'Open Original Location' to edit in Microsoft Office."
-            )
-            self.text_editor.config(state=tk.DISABLED)  # Lock editor
+    def run_search(self):
+        query = self.search_var.get().strip()
+        if not query:
+            self.populate_browse()
+            return
+        self.tree.delete(*self.tree.get_children())
+        self.item_meta.clear()
+        self.loaded_nodes.clear()
+
+        if self.search_mode.get() == "Filename":
+            rows = [f for f in self.store.all_files() if query.lower() in f["filename"].lower()][:SEARCH_LIMIT]
+            snippets = False
         else:
+            rows = self.store.search(query)
+            snippets = self.store.fts
+
+        header = self.tree.insert("", "end", text=f"Results for '{query}'  ({len(rows)})", open=True)
+        for f in rows:
+            snip = ""
+            if snippets and "snippet" in f.keys():
+                snip = f"   —   {f['snippet']}"
+            elif not self.store.fts and f["body"]:
+                snip = self._like_snippet(f["body"], query)
+            leaf = self.tree.insert(header, "end", text=f"{f['filename']}{snip}")
+            self.item_meta[leaf] = ("file", f["id"])
+        self.status_var.set(f"{len(rows)} match(es) for '{query}'")
+
+    @staticmethod
+    def _like_snippet(body, query):
+        i = body.lower().find(query.lower())
+        if i < 0:
+            return ""
+        start, end = max(0, i - 30), min(len(body), i + len(query) + 30)
+        return f"   —   … {body[start:end].strip()} …"
+
+    def clear_search(self):
+        if self.search_var.get():
+            self.search_var.set("")   # trace -> populate_browse
+        else:
+            self.populate_browse()
+
+    def _focus_search(self):
+        self.clear_search()
+        self.status_var.set("Search focused — type to find text across all files")
+
+    # -- selection / preview -------------------------------------------------
+    def on_tree_select(self, _event):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        meta = self.item_meta.get(sel[0])
+        if meta and meta[0] == "file":
+            self.open_file(meta[1])
+
+    def open_file(self, file_id, add_history=True):
+        row = self.store.get(file_id)
+        if not row:
+            return
+        self.current = row
+        if add_history and not self._navigating:
+            self.history = self.history[: self.hist_pos + 1]
+            self.history.append(file_id)
+            self.hist_pos = len(self.history) - 1
+        self._update_nav_buttons()
+        self.render_preview(row)
+
+    def render_preview(self, row):
+        self.text.config(state=tk.NORMAL)
+        self.text.delete(1.0, tk.END)
+        self.load_more_btn.pack_forget()
+        self._preview_path = None
+        ext = row["ext"]
+        path = row["original_path"]
+        editable = bool(row["editable"]) and os.path.exists(path)
+
+        if editable:  # in-app note
+            self.viewer_info.set(f"✏  Editable note — {path}")
             try:
-                cached = self.file_cache.get(filepath)
-                if cached and 'content' in cached:
-                    self.text_editor.insert(tk.END, cached['content'])
-                else:
-                    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-                        self.text_editor.insert(tk.END, f.read())
+                with open(path, encoding="utf-8", errors="ignore") as f:
+                    self.text.insert(tk.END, f.read())
             except Exception as e:
-                messagebox.showerror("Error", f"Could not read file:\n{e}")
+                self.text.insert(tk.END, f"[Could not read note: {e}]")
+            return
 
+        # read-only preview
+        self.text.config(state=tk.NORMAL)
+        if not os.path.exists(path):
+            self.viewer_info.set(f"⚠  Original missing — {path}")
+            self.text.insert(tk.END, row["body"] or "[File no longer at original location.]")
+        elif ext == ".txt":
+            self._preview_path = path
+            self._preview_offset = 0
+            self.viewer_info.set(f"👁  Read-only preview — {path}")
+            self.load_more_preview()
+            return
+        elif ext in OOXML_EXTS:
+            self.viewer_info.set(f"👁  Extracted text preview — {path}")
+            body = row["body"]
+            if body is None:
+                body = TextExtractor.extract(path, ext)
+            self.text.insert(tk.END, body or "[No extractable text found.]")
+        elif ext in LEGACY_OLE_EXTS:
+            self.viewer_info.set(f"🔒  Legacy binary — {path}")
+            self.text.insert(
+                tk.END,
+                f"Preview not available for legacy {ext} (pre-2007 OLE format).\n"
+                "Right-click → Open Original Location to view in Microsoft Office."
+            )
+        self.text.config(state=tk.DISABLED)
+
+    def load_more_preview(self):
+        if not self._preview_path:
+            return
+        self.text.config(state=tk.NORMAL)
+        try:
+            with open(self._preview_path, encoding="utf-8", errors="ignore") as f:
+                f.seek(self._preview_offset)
+                chunk = f.read(PREVIEW_CHUNK)
+        except Exception as e:
+            self.text.insert(tk.END, f"[Read error: {e}]")
+            self.text.config(state=tk.DISABLED)
+            return
+        self.text.insert(tk.END, chunk)
+        self._preview_offset += len(chunk.encode("utf-8", "ignore"))
+        more = len(chunk) == PREVIEW_CHUNK
+        self.text.config(state=tk.DISABLED)
+        if more:
+            self.load_more_btn.pack(side=tk.BOTTOM, pady=3)
+            self.viewer_info.set(f"👁  Read-only preview (showing first {self._preview_offset // 1000} KB) — {self._preview_path}")
+        else:
+            self.load_more_btn.pack_forget()
+
+    # -- notes / editing -----------------------------------------------------
     def new_note(self):
-        filename = f"Draft_{int(time.time())}.txt"
-        filepath = os.path.join(self.vault_dir, filename)
-
-        with open(filepath, 'w', encoding='utf-8') as f:
+        path = os.path.join(self.notes_dir, f"Draft_{int(time.time())}.txt")
+        with open(path, "w", encoding="utf-8") as f:
             f.write("New note...")
+        fid = self.store.upsert({
+            "original_path": path, "vault_path": path, "filename": os.path.basename(path),
+            "ext": ".txt", "category": "Draft Notes", "source_dir": self.notes_dir,
+            "editable": 1, "mtime": os.path.getmtime(path), "size": os.path.getsize(path),
+            "body": "New note...",
+        })
+        self.store.commit()
+        self.populate_browse()
+        self.open_file(fid)
 
-        self.current_file = filepath
-        self.refresh_index()
-        self.load_file_to_editor(filepath)
-
-    def save_current(self):
-        if not self.current_file:
+    def on_edit(self, event):
+        if not self.current or not self.current["editable"]:
             return
-        ext = os.path.splitext(self.current_file)[1].lower()
-        if ext in MS_EXTENSIONS:
-            messagebox.showwarning("Read Only", "Cannot save edits to Microsoft Office binary formats directly from the Vault.")
-            return
-
-        content = self.text_editor.get(1.0, tk.END)
-        if content.endswith('\n'):
-            content = content[:-1]
-
-        with open(self.current_file, 'w', encoding='utf-8') as f:
-            f.write(content)
-
-        category = self.extract_dominant_keyword(content)
-        self.file_cache[self.current_file] = {
-            'content': content,
-            'mtime': os.path.getmtime(self.current_file),
-            'category': category,
-        }
-        self.refresh_index(self.search_var.get())
-
-    def auto_save_draft(self, event):
-        if event.keysym in ['Up', 'Down', 'Left', 'Right', 'Prior', 'Next']:
+        if event.keysym in ("Up", "Down", "Left", "Right", "Prior", "Next"):
             return
         if self._autosave_timer:
             self.root.after_cancel(self._autosave_timer)
-        self._autosave_timer = self.root.after(500, self.perform_auto_save)
+        self._autosave_timer = self.root.after(600, self.save_current)
 
-    def perform_auto_save(self):
-        if not self.current_file:
+    def save_current(self):
+        if not self.current or not self.current["editable"]:
             return
-        ext = os.path.splitext(self.current_file)[1].lower()
-        if ext in MS_EXTENSIONS:
-            return  # never auto-save binary files
-
-        content = self.text_editor.get(1.0, tk.END)
-        if content.endswith('\n'):
+        path = self.current["original_path"]
+        content = self.text.get(1.0, tk.END)
+        if content.endswith("\n"):
             content = content[:-1]
         try:
-            with open(self.current_file, 'w', encoding='utf-8') as f:
+            with open(path, "w", encoding="utf-8") as f:
                 f.write(content)
-            cat = self.file_cache.get(self.current_file, {}).get('category', 'Uncategorized')
-            self.file_cache[self.current_file] = {
-                'content': content,
-                'mtime': os.path.getmtime(self.current_file),
-                'category': cat,
-            }
-        except Exception:
-            pass
+            self.store.upsert({
+                "original_path": path, "vault_path": path, "filename": os.path.basename(path),
+                "ext": ".txt", "category": TextExtractor.dominant_keyword(content) or "Draft Notes",
+                "source_dir": self.notes_dir, "editable": 1, "mtime": os.path.getmtime(path),
+                "size": len(content.encode("utf-8")), "body": content[:INDEX_TEXT_CAP],
+            })
+            self.store.commit()
+            self.current = self.store.get_by_path(path)
+            self.status_var.set(f"Saved {os.path.basename(path)}")
+        except Exception as e:
+            messagebox.showerror("Save failed", str(e))
 
+    # -- navigation ----------------------------------------------------------
+    def go_back(self):
+        if self.hist_pos > 0:
+            self.hist_pos -= 1
+            self._navigate_to(self.history[self.hist_pos])
+
+    def go_forward(self):
+        if self.hist_pos < len(self.history) - 1:
+            self.hist_pos += 1
+            self._navigate_to(self.history[self.hist_pos])
+
+    def _navigate_to(self, file_id):
+        self._navigating = True
+        try:
+            self.open_file(file_id, add_history=False)
+        finally:
+            self._navigating = False
+        self._update_nav_buttons()
+
+    def _update_nav_buttons(self):
+        self.btn_back.config(state=tk.NORMAL if self.hist_pos > 0 else tk.DISABLED)
+        self.btn_fwd.config(state=tk.NORMAL if self.hist_pos < len(self.history) - 1 else tk.DISABLED)
+
+    def clear_view(self):
+        self.tree.selection_remove(self.tree.selection())
+        self.text.config(state=tk.NORMAL)
+        self.text.delete(1.0, tk.END)
+        self.text.config(state=tk.DISABLED)
+        self.load_more_btn.pack_forget()
+        self.current = None
+        self._preview_path = None
+        self.viewer_info.set("Cleared. Select a file to preview.")
+        self.status_var.set("Ready")
+
+    # -- indexing (threaded) -------------------------------------------------
+    def auto_recall_indexed(self):
+        for folder in list(self.indexed_folders):
+            if os.path.exists(folder) and not self.indexer.running:
+                self._begin_index(folder, silent=True)
+
+    def index_folder(self):
+        target = filedialog.askdirectory(title="Select Drive or Folder to Index")
+        if not target:
+            return
+        if self.indexer.running:
+            messagebox.showinfo("Busy", "An index is already running. Cancel it first.")
+            return
+        if target not in self.indexed_folders:
+            self.indexed_folders.append(target)
+            self.store.set_meta("indexed_folders", self.indexed_folders)
+        self._begin_index(target, silent=False)
+
+    def _begin_index(self, target, silent):
+        self._index_silent = silent
+        if self.indexer.start(target):
+            self.btn_cancel.config(state=tk.NORMAL)
+            self.progress.start(12)
+            self.status_var.set(f"Indexing {target} …")
+
+    def cancel_index(self):
+        if self.indexer.running:
+            self.indexer.cancel()
+            self.status_var.set("Cancelling…")
+
+    def _progress_cb(self, scanned, added):
+        self.root.after(0, lambda: self.status_var.set(f"Indexing… {added} added / {scanned} scanned"))
+
+    def _done_cb(self, scanned, added, sec_flags, cancelled):
+        self.root.after(0, lambda: self._index_finished(scanned, added, sec_flags, cancelled))
+
+    def _index_finished(self, scanned, added, sec_flags, cancelled):
+        self.progress.stop()
+        self.btn_cancel.config(state=tk.DISABLED)
+        for flag_type, path in sec_flags:
+            self.sec_tree.insert("", "end", values=(flag_type, path))
+        self.populate_browse()
+        self.refresh_purge_list()
+        state = "cancelled" if cancelled else "complete"
+        self.status_var.set(f"Index {state} — {added} added, {scanned} scanned, {self.store.count()} total")
+        if not getattr(self, "_index_silent", True):
+            msg = f"Index {state}.\nAdded/updated {added} of {scanned} scanned files."
+            if sec_flags:
+                msg += f"\nFlagged {len(sec_flags)} executables/scripts (Security tab)."
+            messagebox.showinfo("Indexing", msg)
+
+    # -- context-menu actions ------------------------------------------------
+    def show_tree_menu(self, event):
+        item = self.tree.identify_row(event.y)
+        if item and self.item_meta.get(item, ("",))[0] == "file":
+            self.tree.selection_set(item)
+            self.tree_menu.tk_popup(event.x_root, event.y_root)
+
+    def _selected_file_row(self):
+        sel = self.tree.selection()
+        if sel and self.item_meta.get(sel[0], ("",))[0] == "file":
+            return self.store.get(self.item_meta[sel[0]][1])
+        return None
+
+    def open_original_location(self):
+        row = self._selected_file_row()
+        if not row:
+            return
+        if os.path.exists(row["original_path"]):
+            reveal_in_file_manager(row["original_path"], select=True)
+        else:
+            messagebox.showwarning("Not Found", "The original file no longer exists.")
+
+    def remove_from_index(self):
+        row = self._selected_file_row()
+        if not row:
+            return
+        if messagebox.askyesno("Remove", f"Remove '{row['filename']}' from the index?\n(The original file is NOT deleted.)"):
+            self.store.delete(row["id"])
+            self.populate_browse()
+            self.refresh_purge_list()
+
+    # -- duplicates ----------------------------------------------------------
     def find_duplicates(self):
-        hashes = {}
-        duplicates = []
-
-        for item_id, filepath in self.file_index.items():
-            if not os.path.exists(filepath):
+        hashes, dups = {}, []
+        for f in self.store.all_files():
+            p = f["original_path"]
+            if not os.path.exists(p):
                 continue
             try:
-                file_hash = self._hash_file(filepath)
+                h = hash_file(p)
             except Exception:
                 continue
-            if file_hash in hashes:
-                duplicates.append((filepath, hashes[file_hash]))
+            if h in hashes:
+                dups.append(f)
             else:
-                hashes[file_hash] = filepath
-
-        if not duplicates:
-            messagebox.showinfo("Duplicates", "No exact duplicate files found in the vault.")
+                hashes[h] = f
+        if not dups:
+            messagebox.showinfo("Duplicates", "No exact duplicate files found.")
             return
-
-        msg = f"Found {len(duplicates)} duplicate(s).\nDo you want to automatically remove the redundant copies from the vault?"
-        if messagebox.askyesno("Remove Duplicates", msg):
+        if messagebox.askyesno("Remove Duplicates",
+                               f"Found {len(dups)} duplicate(s). Send the redundant copies to the Recycle Bin?"):
             removed = 0
-            for dup_path, orig_path in duplicates:
-                try:
-                    self._safe_delete(dup_path)
-                    filename = os.path.basename(dup_path)
-                    if filename in self.metadata["files"]:
-                        del self.metadata["files"][filename]
-                    if dup_path in self.file_cache:
-                        del self.file_cache[dup_path]
+            for f in dups:
+                if safe_delete(f["original_path"], self.trash_dir):
+                    self.store.delete(f["id"])
                     removed += 1
-                except Exception:
-                    pass
-            self.save_metadata()
-            self.refresh_index()
+            self.populate_browse()
             self.refresh_purge_list()
-            messagebox.showinfo("Success", f"Removed {removed} duplicate files.")
+            messagebox.showinfo("Success", f"Removed {removed} duplicate file(s).")
 
-    @staticmethod
-    def _hash_file(filepath):
-        """Chunked SHA-256 so large Office files don't blow up memory."""
-        h = hashlib.sha256()
-        with open(filepath, 'rb') as f:
-            for chunk in iter(lambda: f.read(65536), b''):
-                h.update(chunk)
-        return h.hexdigest()
+    # -- report --------------------------------------------------------------
+    def generate_report(self):
+        path = os.path.join(self.vault_dir, f"Vault_Report_{int(time.time())}.txt")
+        content = (
+            "保管庫 (Vault) レポート\n============================\n作成者: KIMANI S.M.\n"
+            f"インデックス済みファイル数: {self.store.count()}\n"
+            f"インデックス済みフォルダ数: {len(self.indexed_folders)}\n\n対象フォルダ:\n"
+            + "".join(f"- {d}\n" for d in self.indexed_folders)
+        )
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        messagebox.showinfo("レポート作成", f"レポートが作成されました:\n{path}")
 
-    def generate_japanese_report(self):
-        report_path = os.path.join(self.vault_dir, f"Vault_Report_{int(time.time())}.txt")
-        file_count = len(self.file_index)
-        folder_count = len(self.indexed_folders)
-
-        report_content = "保管庫 (Vault) レポート\n"
-        report_content += "============================\n"
-        report_content += "作成者: KIMANI S.M.\n"
-        report_content += f"インデックス済みファイル数: {file_count}\n"
-        report_content += f"インデックス済みフォルダ数: {folder_count}\n\n"
-        report_content += "対象フォルダ:\n"
-        for folder in self.indexed_folders:
-            report_content += f"- {folder}\n"
-
-        with open(report_path, 'w', encoding='utf-8') as f:
-            f.write(report_content)
-        messagebox.showinfo("レポート作成", f"レポートが作成されました:\n{report_path}")
-        self.refresh_index()
-
-    def clear_security_list(self):
-        self.sec_tree.delete(*self.sec_tree.get_children())
-
+    # -- security tab --------------------------------------------------------
     def delete_security_file(self):
-        selections = self.sec_tree.selection()
-        if not selections:
+        sels = self.sec_tree.selection()
+        if not sels:
             return
-
-        # Default to "No" so a stray Enter/click cancels. Deletes are recoverable.
-        if not messagebox.askyesno(
-            "Confirm Delete",
-            f"Send {len(selections)} flagged file(s) to the Recycle Bin / Trash?\n\n"
-            "These are files on your system, outside the vault. They will remain "
-            "recoverable from the Recycle Bin.",
-            default="no", icon="warning",
-        ):
+        if not messagebox.askyesno("Confirm Delete",
+                                   f"Send {len(sels)} flagged file(s) to the Recycle Bin / Trash?\n"
+                                   "They remain recoverable.", default="no", icon="warning"):
             return
-
         removed = 0
-        for item_id in selections:
-            item = self.sec_tree.item(item_id)
-            path = item['values'][1]
-            if self._safe_delete(path):
-                self.sec_tree.delete(item_id)
+        for item in sels:
+            path = self.sec_tree.item(item)["values"][1]
+            if safe_delete(path, self.trash_dir):
+                self.sec_tree.delete(item)
                 removed += 1
-            else:
-                print(f"Could not delete {path}")
         messagebox.showinfo("Done", f"Sent {removed} file(s) to the Recycle Bin / Trash.")
 
     def run_defender_scan(self):
         if not IS_WINDOWS:
             messagebox.showinfo("Unavailable", "Windows Defender scanning is only available on Windows.")
             return
-        selections = self.sec_tree.selection()
-        if not selections:
+        sels = self.sec_tree.selection()
+        if not sels:
             return
-        path = self.sec_tree.item(selections[0])['values'][1]
-        self.scan_progress.start(10)
-        threading.Thread(target=self._execute_defender_thread, args=(path,), daemon=True).start()
+        path = self.sec_tree.item(sels[0])["values"][1]
+        self.sec_progress.start(10)
+        threading.Thread(target=self._defender_thread, args=(path,), daemon=True).start()
 
-    def _execute_defender_thread(self, path):
+    def _defender_thread(self, path):
         try:
-            CREATE_NO_WINDOW = 0x08000000  # Suppresses terminal flashing
             cmd = ["powershell", "-Command", f"Start-MpScan -ScanType CustomScan -ScanPath '{path}'"]
-            process = subprocess.Popen(cmd, creationflags=CREATE_NO_WINDOW, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            process.communicate()
-            self.root.after(0, lambda: messagebox.showinfo("Scan Complete", f"Defender scan finished for:\n{path}"))
+            subprocess.Popen(cmd, creationflags=0x08000000,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
+            self.root.after(0, lambda: messagebox.showinfo("Scan Complete", f"Defender scan finished:\n{path}"))
         except Exception as e:
-            self.root.after(0, lambda: messagebox.showerror("Error", f"Could not execute Defender:\n{e}"))
+            self.root.after(0, lambda: messagebox.showerror("Error", f"Defender failed:\n{e}"))
         finally:
-            self.root.after(0, self.scan_progress.stop)
+            self.root.after(0, self.sec_progress.stop)
 
+    # -- deep purge ----------------------------------------------------------
     def refresh_purge_list(self):
         self.purge_tree.delete(*self.purge_tree.get_children())
-        for filename in os.listdir(self.vault_dir):
-            ext = os.path.splitext(filename)[1].lower()
-            if ext in TRACKED_EXTS:
-                vault_path = os.path.join(self.vault_dir, filename)
-                original_path = self.metadata["files"].get(filename, {}).get("original_path", "Vault Local")
-                self.purge_tree.insert("", "end", values=(filename, vault_path, original_path))
+        for f in self.store.all_files():
+            self.purge_tree.insert("", "end", iid=str(f["id"]), values=(f["filename"], f["original_path"]))
 
     def execute_deep_purge(self):
-        selections = self.purge_tree.selection()
-        if not selections:
+        sels = self.purge_tree.selection()
+        if not sels:
             return
-
-        # Type-to-confirm: Deep Purge deletes the ORIGINAL file on disk and edits
-        # the registry, so a reflexive "Yes" click must never be enough.
         prompt = (
-            f"You are about to DEEP PURGE {len(selections)} file(s).\n\n"
-            "This removes each file from the Vault AND its original location on "
-            "disk, and scrubs Windows Recent-Docs registry traces.\n\n"
-            "Deleted files are sent to the Recycle Bin / Trash where possible, so "
-            "they stay recoverable.\n\n"
+            f"You are about to DEEP PURGE {len(sels)} file(s).\n\n"
+            "This removes each file from the index AND its original location on disk, "
+            "and scrubs Windows Recent-Docs registry traces.\n\n"
+            "Deleted files go to the Recycle Bin / Trash where possible.\n\n"
             "Type  PURGE  (in capitals) to confirm:"
         )
-        answer = simpledialog.askstring("Confirm Deep Purge", prompt, parent=self.root)
-        if answer != "PURGE":
+        if simpledialog.askstring("Confirm Deep Purge", prompt, parent=self.root) != "PURGE":
             messagebox.showinfo("Cancelled", "Deep Purge cancelled — no files were deleted.")
             return
-
         purged = 0
-        for item_id in selections:
-            item = self.purge_tree.item(item_id)
-            filename, vault_path, original_path = item['values']
-
-            if os.path.exists(vault_path):
-                self._safe_delete(vault_path)
-
-            if original_path != "Vault Local" and os.path.exists(original_path):
-                self._safe_delete(original_path)
-
-            if filename in self.metadata["files"]:
-                del self.metadata["files"][filename]
-            if vault_path in self.file_cache:
-                del self.file_cache[vault_path]
-
-            self._purge_registry_mru(filename)
+        for iid in sels:
+            row = self.store.get(int(iid))
+            if not row:
+                continue
+            if row["vault_path"] and os.path.exists(row["vault_path"]):
+                safe_delete(row["vault_path"], self.trash_dir)
+            safe_delete(row["original_path"], self.trash_dir)
+            purge_registry_mru(row["filename"])
+            self.store.delete(row["id"])
             purged += 1
-
-        self.save_metadata()
-        self.refresh_index()
+        self.populate_browse()
         self.refresh_purge_list()
         messagebox.showinfo("Deep Purge Complete", f"Deep purge executed on {purged} file(s).")
-
-    def _purge_registry_mru(self, target_filename):
-        # Cleans Explorer RecentDocs where file traces are heavily kept (Windows only)
-        if not IS_WINDOWS:
-            return
-        try:
-            mru_path = r"Software\Microsoft\Windows\CurrentVersion\Explorer\RecentDocs"
-            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, mru_path, 0, winreg.KEY_READ | winreg.KEY_WRITE)
-
-            count = winreg.QueryInfoKey(key)[1]
-            values_to_delete = []
-
-            for i in range(count):
-                try:
-                    val_name, val_data, val_type = winreg.EnumValue(key, i)
-                    if isinstance(val_data, bytes):
-                        decoded_string = val_data.decode('utf-16le', errors='ignore')
-                        if target_filename.lower() in decoded_string.lower():
-                            values_to_delete.append(val_name)
-                except Exception:
-                    continue
-
-            for v in values_to_delete:
-                winreg.DeleteValue(key, v)
-
-            winreg.CloseKey(key)
-        except Exception as e:
-            print(f"Registry purge skipped/failed for MRU: {e}")
 
 
 if __name__ == "__main__":
