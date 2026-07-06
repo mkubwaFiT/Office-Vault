@@ -18,7 +18,7 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[],
-    hiddenimports=[],
+    hiddenimports=['sqlite3'],  # belt-and-suspenders; also NOT in excludes below
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -28,8 +28,10 @@ a = Analysis(
         'IPython', 'notebook', 'jupyter',
         # Build/dev tooling that should never ship in the runtime
         'pip', 'setuptools', 'wheel', 'pytest', 'pydoc',
-        # Unused stdlib subsystems for a local tkinter file tool
-        'sqlite3', 'test', 'unittest', 'lib2to3', 'distutils',
+        # Unused stdlib subsystems for a local tkinter file tool.
+        # NOTE: do NOT exclude 'sqlite3' — v2 needs it for the FTS5 catalog;
+        # PyInstaller's hook bundles _sqlite3.pyd + sqlite3.dll automatically.
+        'test', 'unittest', 'lib2to3', 'distutils',
     ],
     noarchive=False,
     optimize=2,
