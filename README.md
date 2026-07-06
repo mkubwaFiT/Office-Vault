@@ -1,5 +1,9 @@
 # Vault Toolkit
 
+[![CI](https://github.com/mkubwaFiT/Office-Vault/actions/workflows/ci.yml/badge.svg)](https://github.com/mkubwaFiT/Office-Vault/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/mkubwaFiT/Office-Vault)](https://github.com/mkubwaFiT/Office-Vault/releases/latest)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 A single-window desktop tool for collecting, organizing, searching, and securely
 purging text notes and Microsoft Office documents scattered across your drives.
 

@@ -1,0 +1,152 @@
+"""Headless tests for the non-UI core layers: TextExtractor, VaultStore, Indexer.
+
+Run:  python -m unittest discover -s tests
+These use only the standard library and never construct a Tk window.
+"""
+import os
+import sys
+import zipfile
+import tempfile
+import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import vault_toolkit as vt  # noqa: E402
+
+
+def _write(path, data, mode="w"):
+    with open(path, mode) as f:
+        f.write(data)
+
+
+def _docx(path, text):
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr(
+            "word/document.xml",
+            '<?xml version="1.0"?><w:document xmlns:w="http://w"><w:body><w:p><w:r>'
+            f"<w:t>{text}</w:t></w:r></w:p></w:body></w:document>",
+        )
+
+
+def _xlsx(path, text):
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("xl/sharedStrings.xml", f'<sst xmlns="http://s"><si><t>{text}</t></si></sst>')
+
+
+def _pptx(path, text):
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("ppt/slides/slide1.xml",
+                   f'<p:sld xmlns:p="http://p" xmlns:a="http://a"><a:t>{text}</a:t></p:sld>')
+
+
+class TestExtractor(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def test_ooxml_extraction(self):
+        d, x, p = (os.path.join(self.tmp, n) for n in ("a.docx", "a.xlsx", "a.pptx"))
+        _docx(d, "Confidential merger plan")
+        _xlsx(x, "Quarterly budget forecast")
+        _pptx(p, "Roadmap slide deck")
+        self.assertIn("merger", vt.TextExtractor.extract(d, ".docx"))
+        self.assertIn("budget", vt.TextExtractor.extract(x, ".xlsx"))
+        self.assertIn("Roadmap", vt.TextExtractor.extract(p, ".pptx"))
+
+    def test_bad_file_is_graceful(self):
+        bad = os.path.join(self.tmp, "broken.docx")
+        with open(bad, "wb") as f:
+            f.write(b"not a zip")
+        self.assertEqual(vt.TextExtractor.extract(bad, ".docx"), "")
+
+    def test_dominant_keyword(self):
+        self.assertEqual(vt.TextExtractor.dominant_keyword("budget budget report report report"), "Report")
+
+
+class TestStore(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.st = vt.VaultStore(os.path.join(self.tmp, "vault.db"))
+
+    def tearDown(self):
+        self.st.close()
+
+    def _add(self, name, body):
+        p = os.path.join(self.tmp, name)
+        return self.st.upsert({
+            "original_path": p, "vault_path": None, "filename": name,
+            "ext": os.path.splitext(name)[1], "category": "T", "source_dir": self.tmp,
+            "editable": 0, "mtime": 1.0, "size": 1, "body": body,
+        })
+
+    def test_fulltext_search_across_types(self):
+        self._add("d.docx", "Confidential merger plan alpha")
+        self._add("a.txt", "finance report q3")
+        self.st.commit()
+        self.assertTrue(any("d.docx" in r["filename"] for r in self.st.search("merger")))
+        self.assertTrue(any("a.txt" in r["filename"] for r in self.st.search("finance")))
+
+    def test_prefix_and_filename_search(self):
+        self._add("budget_2026.xlsx", "quarterly numbers")
+        self.st.commit()
+        self.assertTrue(any("budget" in r["filename"] for r in self.st.search("budg")))
+        self.assertEqual(len(self.st.search_filename("budget")), 1)
+
+    def test_delete_removes_from_index_and_fts(self):
+        fid = self._add("gone.txt", "temporary secret token")
+        self.st.commit()
+        self.st.delete(fid)
+        self.assertEqual(self.st.count(), 0)
+        self.assertEqual(self.st.search("secret"), [])
+
+
+class TestIndexer(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.src = os.path.join(self.tmp, "src")
+        os.makedirs(os.path.join(self.src, "sub"))
+        _write(os.path.join(self.src, "a.txt"), "budget report finance")
+        _docx(os.path.join(self.src, "sub", "b.docx"), "Confidential merger plan")
+        _write(os.path.join(self.src, "c.exe"), b"MZ", "wb")          # danger
+        _write(os.path.join(self.src, "ignore.png"), b"x", "wb")      # untracked
+        self.st = vt.VaultStore(os.path.join(self.tmp, "idx.db"))
+
+    def tearDown(self):
+        self.st.close()
+
+    def _run(self, target):
+        res = {}
+        idx = vt.Indexer(self.st, os.path.join(self.tmp, "vault"),
+                         on_progress=lambda s, a: None,
+                         on_done=lambda s, a, sec, canc: res.update(scanned=s, added=a, sec=sec, canc=canc))
+        idx._run(target, copy_to_vault=False)
+        self.st.commit()
+        return res
+
+    def test_index_counts_flags_and_search(self):
+        res = self._run(self.src)
+        self.assertEqual(res["scanned"], 2)                 # a.txt + b.docx (png/exe excluded)
+        self.assertEqual(res["added"], 2)
+        self.assertEqual(res["sec"], [("Executable/Script", os.path.join(self.src, "c.exe"))])
+        self.assertFalse(res["canc"])
+        self.assertTrue(any("b.docx" in r["filename"] for r in self.st.search("merger")))
+
+    def test_reindex_is_idempotent(self):
+        self._run(self.src)
+        self.assertEqual(self._run(self.src)["added"], 0)
+
+    def test_cancellation_stops_scan(self):
+        big = os.path.join(self.tmp, "big")
+        os.makedirs(big)
+        for i in range(30):
+            _write(os.path.join(big, f"f{i}.txt"), "x")
+        res = {}
+        idx = vt.Indexer(self.st, os.path.join(self.tmp, "vault"),
+                         on_progress=lambda s, a: None,
+                         on_done=lambda s, a, sec, canc: res.update(added=a, canc=canc))
+        idx.cancel()
+        idx._run(big, False)
+        self.assertTrue(res["canc"])
+        self.assertEqual(res["added"], 0)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

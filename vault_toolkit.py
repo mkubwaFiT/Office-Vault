@@ -28,8 +28,11 @@ import subprocess
 import xml.etree.ElementTree as ET
 from collections import Counter
 
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, simpledialog
+try:
+    import tkinter as tk
+    from tkinter import ttk, filedialog, messagebox, simpledialog
+except Exception:  # headless (e.g. CI unit tests of the core layers) — GUI unused
+    tk = ttk = filedialog = messagebox = simpledialog = None
 
 # winreg / explorer / Defender are Windows-only.
 IS_WINDOWS = sys.platform.startswith("win")
@@ -257,6 +260,14 @@ class VaultStore:
     def all_files(self):
         with self._lock:
             return self.conn.execute("SELECT * FROM files ORDER BY filename").fetchall()
+
+    def search_filename(self, query, limit=SEARCH_LIMIT):
+        like = f"%{query}%"
+        with self._lock:
+            return self.conn.execute(
+                "SELECT * FROM files WHERE filename LIKE ? ORDER BY filename LIMIT ?",
+                (like, limit),
+            ).fetchall()
 
     # -- search --------------------------------------------------------------
     def search(self, query, limit=SEARCH_LIMIT):
@@ -743,7 +754,7 @@ class VaultToolkitApp:
         self.loaded_nodes.clear()
 
         if self.search_mode.get() == "Filename":
-            rows = [f for f in self.store.all_files() if query.lower() in f["filename"].lower()][:SEARCH_LIMIT]
+            rows = self.store.search_filename(query)
             snippets = False
         else:
             rows = self.store.search(query)
@@ -1029,6 +1040,14 @@ class VaultToolkitApp:
 
     # -- duplicates ----------------------------------------------------------
     def find_duplicates(self):
+        if getattr(self, "_dup_running", False):
+            return
+        self._dup_running = True
+        self.status_var.set("Scanning for duplicates…")
+        threading.Thread(target=self._dup_worker, daemon=True).start()
+
+    def _dup_worker(self):
+        # Hashing every file is I/O-heavy — never do it on the UI thread.
         hashes, dups = {}, []
         for f in self.store.all_files():
             p = f["original_path"]
@@ -1042,6 +1061,11 @@ class VaultToolkitApp:
                 dups.append(f)
             else:
                 hashes[h] = f
+        self.root.after(0, lambda: self._dup_done(dups))
+
+    def _dup_done(self, dups):
+        self._dup_running = False
+        self.status_var.set("Ready")
         if not dups:
             messagebox.showinfo("Duplicates", "No exact duplicate files found.")
             return

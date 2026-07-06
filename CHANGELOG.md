@@ -3,6 +3,23 @@
 All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- `find_duplicates` hashed every file on the UI thread (could freeze on large
+  vaults) — moved to a background worker.
+
+### Changed
+- Filename search now runs as a SQL `LIKE` query instead of loading all rows.
+- The `tkinter` import is guarded so the core layers import headlessly (for CI).
+
+### Added
+- `tests/` unit suite (extraction, catalog/FTS search, indexing, cancellation)
+  and a GitHub Actions CI workflow running byte-compile + tests on 3.9 and 3.12.
+
+> These are source changes; the published v2.0.0 binary predates them — rebuild
+> for a refreshed `.exe`.
+
 ## [2.0.0] — 2026-07-01
 
 Architecture rebuild for scale, search, and preview. **Breaking:** the data
