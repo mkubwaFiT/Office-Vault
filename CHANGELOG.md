@@ -3,7 +3,7 @@
 All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [2.1.0] — 2026-07-06
 
 ### Fixed
 - `find_duplicates` hashed every file on the UI thread (could freeze on large
@@ -17,8 +17,7 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 - `tests/` unit suite (extraction, catalog/FTS search, indexing, cancellation)
   and a GitHub Actions CI workflow running byte-compile + tests on 3.9 and 3.12.
 
-> These are source changes; the published v2.0.0 binary predates them — rebuild
-> for a refreshed `.exe`.
+[2.1.0]: https://github.com/mkubwaFiT/Office-Vault/releases/tag/v2.1.0
 
 ## [2.0.0] — 2026-07-01
 
