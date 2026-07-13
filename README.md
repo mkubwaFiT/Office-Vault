@@ -31,9 +31,17 @@ SmartScreen notice because the build is unsigned → *More info → Run anyway*.
 
 - **Full-text search across everything** — a SQLite **FTS5** index lets you find
   words *inside* `.txt` notes **and** Office documents (`.docx/.xlsx/.pptx` text is
-  extracted at index time). Results show matching files with a highlighted snippet.
-  Toggle between full-text and filename search; the box is debounced so typing
-  never stalls. (Falls back to `LIKE` search if FTS5 is unavailable.)
+  extracted at index time). Excel search covers **every worksheet** of a workbook
+  (shared strings *and* per-sheet inline strings). Results show matching files with
+  a highlighted snippet. Toggle full-text/filename search and restrict it to a
+  single **extension type**; the box is debounced. (Falls back to `LIKE` if FTS5 is
+  unavailable.)
+- **Organize by type + file properties** — group the tree by **extension type**
+  (all files of a kind across every folder and subfolder) or by folder, with
+  **Date Modified, Size, Type, and Location** columns per file.
+- **Multi-select cleanup** — select any mix of files, subfolders, or whole
+  extension groups and send them to the Recycle Bin in one action (button,
+  right-click, or `Delete`). Recoverable; contents are never altered.
 - **Scales to large disks — index in place** — indexing catalogs files where they
   live instead of copying every document into the vault, and runs in a
   **cancellable** background scan with a live progress/count and a **Cancel** button.
@@ -100,12 +108,16 @@ existing metadata).
    files (`.txt` + Office docs) are catalogued **in place** (originals are not
    moved or copied) with a live count; hit **Cancel** to stop a long scan.
    Indexed folders are remembered and re-synced in the background on next launch.
-2. **Browse** — the left tree lazily loads by source folder → category. Click a
-   file to preview it. Use **◀ Back / Forward ▶** (or `Alt+←/→`) to retrace, and
-   **Clear** to reset the view.
-3. **Search** — type to search **inside** every indexed file (full-text) or switch
-   the dropdown to *Filename*. Results list matching files with a snippet; the box
-   is debounced. `Ctrl+F` focuses it, `Esc` / **✕** clears it.
+2. **Browse** — pick **Group by: Extension** to see every file of a type across all
+   folders/subfolders, or **Folder** for the source → category view. Each file shows
+   Date Modified, Size, Type, and Location. Click a file to preview; **◀ Back /
+   Forward ▶** (or `Alt+←/→`) retrace, **Clear** resets.
+3. **Search** — type to search **inside** every indexed file (full-text, all Excel
+   worksheets included) or switch to *Filename*. The **Type** dropdown restricts the
+   search to one extension. Results list matching files with a snippet; the box is
+   debounced. `Ctrl+F` focuses it, `Esc` / **✕** clears it.
+4. **Clean up junk** — select any mix of files, subfolders, or extension groups and
+   click **🗑 Delete Selected** (or press `Delete`) to send them to the Recycle Bin.
 4. **Preview & notes** — Office and indexed `.txt` open **read-only** (large text
    pages in via *Load more*); right-click → *Open Original Location* to edit in the
    source app. **New Note** creates an editable note in the vault that auto-saves

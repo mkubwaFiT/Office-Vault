@@ -83,12 +83,37 @@ class TextExtractor:
             if ext == '.docx':
                 return TextExtractor._ooxml(path, cap, member='word/document.xml')
             if ext == '.xlsx':
-                return TextExtractor._ooxml(path, cap, member='xl/sharedStrings.xml')
+                return TextExtractor._xlsx(path, cap)
             if ext == '.pptx':
                 return TextExtractor._ooxml(path, cap, member_prefix='ppt/slides/slide')
         except Exception as e:
             log.warning("extract failed for %s: %s", path, e)
         return ""
+
+    @staticmethod
+    def _xlsx(path, cap):
+        """Extract text from the shared-string table AND every worksheet's inline
+        strings, so a word in *any* sheet of a multi-worksheet workbook is indexed
+        and searchable. (Shared strings are workbook-global; inline `<is><t>` live
+        in each sheet — both are collected here.)"""
+        texts, total = [], 0
+        with zipfile.ZipFile(path) as z:
+            names = z.namelist()
+            parts = (['xl/sharedStrings.xml'] if 'xl/sharedStrings.xml' in names else []) + sorted(
+                n for n in names if n.startswith('xl/worksheets/sheet') and n.endswith('.xml')
+            )
+            for name in parts:
+                with z.open(name) as fh:
+                    for _event, elem in ET.iterparse(fh):
+                        if elem.tag.rsplit('}', 1)[-1] == 't' and elem.text:
+                            texts.append(elem.text)
+                            total += len(elem.text)
+                        elem.clear()
+                        if total >= cap:
+                            break
+                if total >= cap:
+                    break
+        return ' '.join(texts)[:cap]
 
     @staticmethod
     def _ooxml(path, cap, member=None, member_prefix=None):
@@ -261,16 +286,43 @@ class VaultStore:
         with self._lock:
             return self.conn.execute("SELECT * FROM files ORDER BY filename").fetchall()
 
-    def search_filename(self, query, limit=SEARCH_LIMIT):
-        like = f"%{query}%"
+    def extensions(self):
+        """Distinct extensions present, with counts — for the group view + filter."""
         with self._lock:
             return self.conn.execute(
-                "SELECT * FROM files WHERE filename LIKE ? ORDER BY filename LIMIT ?",
-                (like, limit),
+                "SELECT ext, COUNT(*) n FROM files GROUP BY ext ORDER BY ext"
             ).fetchall()
 
+    def files_by_ext(self, ext):
+        with self._lock:
+            return self.conn.execute(
+                "SELECT * FROM files WHERE ext=? ORDER BY filename", (ext,)
+            ).fetchall()
+
+    def files_by_source(self, source_dir):
+        with self._lock:
+            return self.conn.execute(
+                "SELECT * FROM files WHERE source_dir=? ORDER BY filename", (source_dir,)
+            ).fetchall()
+
+    @staticmethod
+    def _ext_clause(exts, params):
+        """Append an `AND ext IN (...)` filter to a query if exts is given."""
+        if not exts:
+            return ""
+        params.extend(exts)
+        return " AND ext IN (%s)" % ",".join("?" for _ in exts)
+
+    def search_filename(self, query, limit=SEARCH_LIMIT, exts=None):
+        params = [f"%{query}%"]
+        sql = "SELECT * FROM files WHERE filename LIKE ?" + self._ext_clause(exts, params)
+        sql += " ORDER BY filename LIMIT ?"
+        params.append(limit)
+        with self._lock:
+            return self.conn.execute(sql, params).fetchall()
+
     # -- search --------------------------------------------------------------
-    def search(self, query, limit=SEARCH_LIMIT):
+    def search(self, query, limit=SEARCH_LIMIT, exts=None):
         query = (query or "").strip()
         if not query:
             return []
@@ -278,26 +330,24 @@ class VaultStore:
             tokens = re.findall(r"\w+", query)
             if not tokens:
                 return []
-            match = " ".join(f"{t}*" for t in tokens)
+            params = [" ".join(f"{t}*" for t in tokens)]
+            sql = ("SELECT f.*, snippet(files_fts, 1, '«', '»', ' … ', 12) AS snippet "
+                   "FROM files_fts JOIN files f ON f.id = files_fts.rowid "
+                   "WHERE files_fts MATCH ?") + self._ext_clause(exts, params)
+            sql += " ORDER BY rank LIMIT ?"
+            params.append(limit)
             try:
                 with self._lock:
-                    rows = self.conn.execute(
-                        """SELECT f.*, snippet(files_fts, 1, '«', '»', ' … ', 12) AS snippet
-                           FROM files_fts JOIN files f ON f.id = files_fts.rowid
-                           WHERE files_fts MATCH ? ORDER BY rank LIMIT ?""",
-                        (match, limit),
-                    ).fetchall()
-                return rows
+                    return self.conn.execute(sql, params).fetchall()
             except sqlite3.OperationalError as e:
                 log.warning("FTS query failed (%s) — using LIKE", e)
         # LIKE fallback
-        like = f"%{query}%"
+        params = [f"%{query}%", f"%{query}%"]
+        sql = "SELECT * FROM files WHERE (filename LIKE ? OR body LIKE ?)" + self._ext_clause(exts, params)
+        sql += " ORDER BY filename LIMIT ?"
+        params.append(limit)
         with self._lock:
-            rows = self.conn.execute(
-                "SELECT * FROM files WHERE filename LIKE ? OR body LIKE ? ORDER BY filename LIMIT ?",
-                (like, like, limit),
-            ).fetchall()
-        return rows
+            return self.conn.execute(sql, params).fetchall()
 
     def close(self):
         with self._lock:
@@ -524,8 +574,8 @@ class VaultToolkitApp:
 
     def __init__(self, root):
         self.root = root
-        self.root.title("Vault Toolkit v2 (Text + Office) - Assembler: KIMANI S.M.")
-        self.root.geometry("1180x740")
+        self.root.title("Vault Toolkit v2.2 (Text + Office) - Assembler: KIMANI S.M.")
+        self.root.geometry("1240x760")
 
         self.vault_dir = os.path.join(os.path.expanduser("~"), "TextVault_Data")
         self.notes_dir = os.path.join(self.vault_dir, "Notes")
@@ -610,15 +660,21 @@ class VaultToolkitApp:
         btn(tb, "Report", self.generate_report)
         btn(tb, "Open Vault", lambda: reveal_in_file_manager(self.vault_dir))
 
-        # Search (right side): mode + entry + clear
+        # Search (right side): type filter + mode + entry + clear
         sf = tk.Frame(tb)
         sf.pack(side=tk.RIGHT, padx=5)
+        tk.Label(sf, text="Type:").pack(side=tk.LEFT)
+        self.ext_filter = tk.StringVar(value="All types")
+        self.ext_combo = ttk.Combobox(sf, textvariable=self.ext_filter, values=["All types"],
+                                      width=11, state="readonly")
+        self.ext_combo.pack(side=tk.LEFT, padx=(2, 4))
+        self.ext_combo.bind("<<ComboboxSelected>>", lambda e: self.run_search())
         self.search_mode = tk.StringVar(value="Full-text")
         ttk.Combobox(sf, textvariable=self.search_mode, values=["Full-text", "Filename"],
                      width=9, state="readonly").pack(side=tk.LEFT, padx=(0, 4))
         self.search_var = tk.StringVar()
         self.search_var.trace("w", self.on_search_changed)
-        tk.Entry(sf, textvariable=self.search_var, width=28).pack(side=tk.LEFT)
+        tk.Entry(sf, textvariable=self.search_var, width=24).pack(side=tk.LEFT)
         tk.Button(sf, text="✕", command=self.clear_search).pack(side=tk.LEFT, padx=(2, 0))
 
         # Status + progress bar row
@@ -634,17 +690,45 @@ class VaultToolkitApp:
         self.paned.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
         left = tk.Frame(self.paned)
+        # Tree toolbar: group-by selector + multi-select delete
+        tree_bar = tk.Frame(left)
+        tree_bar.pack(side=tk.TOP, fill=tk.X)
+        tk.Label(tree_bar, text="Group by:").pack(side=tk.LEFT, padx=(2, 0))
+        self.group_mode = tk.StringVar(value="Extension")
+        gcb = ttk.Combobox(tree_bar, textvariable=self.group_mode, values=["Extension", "Folder"],
+                           width=10, state="readonly")
+        gcb.pack(side=tk.LEFT, padx=4, pady=2)
+        gcb.bind("<<ComboboxSelected>>", lambda e: self.populate_browse())
+        tk.Button(tree_bar, text="🗑 Delete Selected", command=self.delete_selected).pack(side=tk.RIGHT, padx=2)
+
+        cols = ("modified", "size", "type", "location")
         ys = ttk.Scrollbar(left, orient="vertical")
-        self.tree = ttk.Treeview(left, yscrollcommand=ys.set, selectmode="extended")
+        xs = ttk.Scrollbar(left, orient="horizontal")
+        self.tree = ttk.Treeview(left, columns=cols, selectmode="extended",
+                                 yscrollcommand=ys.set, xscrollcommand=xs.set)
+        self.tree.heading("#0", text="Name")
+        self.tree.heading("modified", text="Date Modified")
+        self.tree.heading("size", text="Size")
+        self.tree.heading("type", text="Type")
+        self.tree.heading("location", text="Location")
+        self.tree.column("#0", width=280, stretch=True)
+        self.tree.column("modified", width=130, anchor="w", stretch=False)
+        self.tree.column("size", width=80, anchor="e", stretch=False)
+        self.tree.column("type", width=150, anchor="w", stretch=False)
+        self.tree.column("location", width=260, anchor="w", stretch=False)
         ys.config(command=self.tree.yview)
+        xs.config(command=self.tree.xview)
         ys.pack(side=tk.RIGHT, fill=tk.Y)
+        xs.pack(side=tk.BOTTOM, fill=tk.X)
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.tree.bind('<<TreeviewSelect>>', self.on_tree_select)
         self.tree.bind('<<TreeviewOpen>>', self.on_tree_open)
         self.tree.bind("<Button-3>", self.show_tree_menu)
+        self.tree.bind("<Delete>", lambda e: self.delete_selected())
         self.tree_menu = tk.Menu(self.root, tearoff=0)
         self.tree_menu.add_command(label="Open Original Location", command=self.open_original_location)
-        self.tree_menu.add_command(label="Remove from Index", command=self.remove_from_index)
+        self.tree_menu.add_command(label="Delete Selected (Recycle Bin)", command=self.delete_selected)
+        self.tree_menu.add_command(label="Remove from Index (keep file)", command=self.remove_from_index)
         self.paned.add(left, weight=1)
 
         self.notebook = ttk.Notebook(self.paned)
@@ -709,16 +793,23 @@ class VaultToolkitApp:
         self.purge_tree.pack(fill=tk.BOTH, expand=True)
         self.purge_tree.bind("<Visibility>", lambda e: self.refresh_purge_list())
 
-    # -- browse tree (lazy) --------------------------------------------------
+    # -- browse tree (lazy, columnar) ---------------------------------------
     def populate_browse(self):
         self.tree.delete(*self.tree.get_children())
         self.item_meta.clear()
         self.loaded_nodes.clear()
-        for row in self.store.source_dirs():
-            label = self.NOTES_LABEL if row["source_dir"] == self.notes_dir else row["source_dir"]
-            node = self.tree.insert("", "end", text=f"{label}  ({row['n']})", open=False)
-            self.item_meta[node] = ("src", row["source_dir"])
-            self.tree.insert(node, "end", text="…")  # lazy placeholder
+        self._refresh_ext_filter()
+        if self.group_mode.get() == "Folder":
+            for row in self.store.source_dirs():
+                label = self.NOTES_LABEL if row["source_dir"] == self.notes_dir else row["source_dir"]
+                node = self.tree.insert("", "end", text=f"{label}  ({row['n']})", open=False)
+                self.item_meta[node] = ("src", row["source_dir"])
+                self.tree.insert(node, "end", text="…")
+        else:  # Extension — groups all files of a type across every subfolder
+            for row in self.store.extensions():
+                node = self.tree.insert("", "end", text=f"{self._ext_label(row['ext'])}  ({row['n']})", open=False)
+                self.item_meta[node] = ("ext", row["ext"])
+                self.tree.insert(node, "end", text="…")
         self.status_var.set(f"Ready — {self.store.count()} files indexed")
 
     def on_tree_open(self, _event):
@@ -727,16 +818,58 @@ class VaultToolkitApp:
             return
         kind = self.item_meta[node]
         self.tree.delete(*self.tree.get_children(node))  # drop placeholder
-        if kind[0] == "src":
+        if kind[0] == "ext":
+            for f in self.store.files_by_ext(kind[1]):
+                self._insert_file_node(node, f)
+        elif kind[0] == "src":
             for row in self.store.categories(kind[1]):
                 cat = self.tree.insert(node, "end", text=f"{row['category']}  ({row['n']})", open=False)
                 self.item_meta[cat] = ("cat", kind[1], row["category"])
                 self.tree.insert(cat, "end", text="…")
         elif kind[0] == "cat":
             for f in self.store.files_in(kind[1], kind[2]):
-                leaf = self.tree.insert(node, "end", text=f["filename"])
-                self.item_meta[leaf] = ("file", f["id"])
+                self._insert_file_node(node, f)
         self.loaded_nodes.add(node)
+
+    # -- helpers: file rows, properties, labels ------------------------------
+    def _insert_file_node(self, parent, f, extra_text=""):
+        leaf = self.tree.insert(
+            parent, "end", text=f"{f['filename']}{extra_text}",
+            values=(self._fmt_time(f["mtime"]), self._human_size(f["size"]),
+                    MS_EXTENSIONS.get(f["ext"], f["ext"] or "file"), f["source_dir"]),
+        )
+        self.item_meta[leaf] = ("file", f["id"])
+        return leaf
+
+    @staticmethod
+    def _ext_label(ext):
+        if ext in MS_EXTENSIONS:
+            return f"{MS_EXTENSIONS[ext]} ({ext})"
+        if ext == ".txt":
+            return "Text files (.txt)"
+        return f"{ext or '(no extension)'} files"
+
+    @staticmethod
+    def _fmt_time(mtime):
+        try:
+            return time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime or 0))
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _human_size(n):
+        n = float(n or 0)
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if n < 1024:
+                return f"{int(n)} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+            n /= 1024
+        return f"{n:.1f} PB"
+
+    def _refresh_ext_filter(self):
+        vals = ["All types"] + [r["ext"] for r in self.store.extensions()]
+        self.ext_combo["values"] = vals
+        if self.ext_filter.get() not in vals:
+            self.ext_filter.set("All types")
 
     # -- search --------------------------------------------------------------
     def on_search_changed(self, *_):
@@ -746,30 +879,49 @@ class VaultToolkitApp:
 
     def run_search(self):
         query = self.search_var.get().strip()
+        exts = None if self.ext_filter.get() == "All types" else [self.ext_filter.get()]
+
+        # No text query: honour a standalone Type filter, else show the browse tree.
         if not query:
-            self.populate_browse()
+            if exts:
+                self._show_type_listing(exts[0])
+            else:
+                self.populate_browse()
             return
+
         self.tree.delete(*self.tree.get_children())
         self.item_meta.clear()
         self.loaded_nodes.clear()
 
         if self.search_mode.get() == "Filename":
-            rows = self.store.search_filename(query)
+            rows = self.store.search_filename(query, exts=exts)
             snippets = False
         else:
-            rows = self.store.search(query)
+            rows = self.store.search(query, exts=exts)
             snippets = self.store.fts
 
-        header = self.tree.insert("", "end", text=f"Results for '{query}'  ({len(rows)})", open=True)
+        scope = "" if not exts else f" in {exts[0]}"
+        header = self.tree.insert("", "end", text=f"Results for '{query}'{scope}  ({len(rows)})", open=True)
+        self.item_meta[header] = ("results",)
         for f in rows:
             snip = ""
-            if snippets and "snippet" in f.keys():
+            if snippets and "snippet" in f.keys() and f["snippet"]:
                 snip = f"   —   {f['snippet']}"
             elif not self.store.fts and f["body"]:
                 snip = self._like_snippet(f["body"], query)
-            leaf = self.tree.insert(header, "end", text=f"{f['filename']}{snip}")
-            self.item_meta[leaf] = ("file", f["id"])
-        self.status_var.set(f"{len(rows)} match(es) for '{query}'")
+            self._insert_file_node(header, f, extra_text=snip)
+        self.status_var.set(f"{len(rows)} match(es) for '{query}'{scope}")
+
+    def _show_type_listing(self, ext):
+        self.tree.delete(*self.tree.get_children())
+        self.item_meta.clear()
+        self.loaded_nodes.clear()
+        rows = self.store.files_by_ext(ext)
+        header = self.tree.insert("", "end", text=f"All {self._ext_label(ext)}  ({len(rows)})", open=True)
+        self.item_meta[header] = ("results",)
+        for f in rows:
+            self._insert_file_node(header, f)
+        self.status_var.set(f"{len(rows)} {ext} file(s)")
 
     @staticmethod
     def _like_snippet(body, query):
@@ -1010,9 +1162,64 @@ class VaultToolkitApp:
     # -- context-menu actions ------------------------------------------------
     def show_tree_menu(self, event):
         item = self.tree.identify_row(event.y)
-        if item and self.item_meta.get(item, ("",))[0] == "file":
+        if not item:
+            return
+        # Keep an existing multi-selection; otherwise select what was clicked.
+        if item not in self.tree.selection():
             self.tree.selection_set(item)
-            self.tree_menu.tk_popup(event.x_root, event.y_root)
+        self.tree_menu.tk_popup(event.x_root, event.y_root)
+
+    # -- multi-select delete (files, subfolders, or whole extension groups) --
+    def _collect_selected_file_ids(self):
+        """Resolve the current selection (files AND group nodes) to a flat set of
+        file ids, querying the store so lazily-unexpanded groups still resolve."""
+        ids = set()
+        for item in self.tree.selection():
+            meta = self.item_meta.get(item)
+            if not meta:
+                continue
+            if meta[0] == "file":
+                ids.add(meta[1])
+            elif meta[0] == "ext":
+                ids.update(f["id"] for f in self.store.files_by_ext(meta[1]))
+            elif meta[0] == "src":
+                ids.update(f["id"] for f in self.store.files_by_source(meta[1]))
+            elif meta[0] == "cat":
+                ids.update(f["id"] for f in self.store.files_in(meta[1], meta[2]))
+            elif meta[0] == "results":  # a search/type header: take its listed files
+                for child in self.tree.get_children(item):
+                    cm = self.item_meta.get(child)
+                    if cm and cm[0] == "file":
+                        ids.add(cm[1])
+        return ids
+
+    def delete_selected(self):
+        ids = self._collect_selected_file_ids()
+        if not ids:
+            messagebox.showinfo("Delete", "Select one or more files, folders, or type groups first.")
+            return
+        if not messagebox.askyesno(
+            "Confirm Delete",
+            f"Send {len(ids)} file(s) to the Recycle Bin / Trash and remove them from the index?\n\n"
+            "Originals are moved to the Recycle Bin (recoverable). File contents are never altered.",
+            default="no", icon="warning",
+        ):
+            return
+        cur_id = self.current["id"] if self.current else None
+        removed = 0
+        for fid in ids:
+            row = self.store.get(fid)
+            if not row:
+                continue
+            if safe_delete(row["original_path"], self.trash_dir):
+                self.store.delete(fid)
+                removed += 1
+        if cur_id in ids:
+            self.clear_view()
+        self.populate_browse()
+        self.refresh_purge_list()
+        self.status_var.set(f"Deleted {removed} file(s) to the Recycle Bin")
+        messagebox.showinfo("Deleted", f"Sent {removed} file(s) to the Recycle Bin / Trash.")
 
     def _selected_file_row(self):
         sel = self.tree.selection()

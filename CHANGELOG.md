@@ -3,6 +3,24 @@
 All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **Group by extension type** — the browse tree can group *all* files of a type
+  across every indexed folder and subfolder (toggle Extension ↔ Folder).
+- **Type filter in search** — restrict a full-text or filename search to one
+  extension (e.g. only `.xlsx`); with an empty query it lists all files of that type.
+- **File property columns** — Date Modified, Size, Type, and Location now show
+  next to each file in the tree.
+- **Multi-select delete** — select any mix of files, subfolders, or whole
+  extension groups and send them to the Recycle Bin (recoverable) in one action,
+  via button, right-click, or the `Delete` key. File contents are never altered.
+
+### Changed
+- **Excel search now covers every worksheet** — `.xlsx` extraction reads the
+  shared-string table *and* each sheet's inline strings, so a word in any sheet of
+  a multi-worksheet workbook is indexed and searchable.
+
 ## [2.1.0] — 2026-07-06
 
 ### Fixed

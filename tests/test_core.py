@@ -32,6 +32,18 @@ def _xlsx(path, text):
         z.writestr("xl/sharedStrings.xml", f'<sst xmlns="http://s"><si><t>{text}</t></si></sst>')
 
 
+def _xlsx_multisheet(path, shared, *inline_per_sheet):
+    """Workbook with a shared-string table plus inline strings in extra sheets."""
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("xl/sharedStrings.xml", f'<sst xmlns="http://s"><si><t>{shared}</t></si></sst>')
+        z.writestr("xl/worksheets/sheet1.xml",
+                   '<worksheet xmlns="http://s"><sheetData><row><c t="s"><v>0</v></c></row></sheetData></worksheet>')
+        for i, txt in enumerate(inline_per_sheet, start=2):
+            z.writestr(f"xl/worksheets/sheet{i}.xml",
+                       f'<worksheet xmlns="http://s"><sheetData><row><c t="inlineStr">'
+                       f'<is><t>{txt}</t></is></c></row></sheetData></worksheet>')
+
+
 def _pptx(path, text):
     with zipfile.ZipFile(path, "w") as z:
         z.writestr("ppt/slides/slide1.xml",
@@ -56,6 +68,16 @@ class TestExtractor(unittest.TestCase):
         with open(bad, "wb") as f:
             f.write(b"not a zip")
         self.assertEqual(vt.TextExtractor.extract(bad, ".docx"), "")
+
+    def test_xlsx_extracts_all_worksheets(self):
+        # A word that only appears as an inline string in sheet 2/3 must still be
+        # extracted, so full-text search reaches every worksheet of a workbook.
+        x = os.path.join(self.tmp, "book.xlsx")
+        _xlsx_multisheet(x, "Revenue", "Zephyrium confidential", "Appendix notes")
+        body = vt.TextExtractor.extract(x, ".xlsx")
+        self.assertIn("Revenue", body)      # shared string (sheet 1)
+        self.assertIn("Zephyrium", body)    # inline string, sheet 2
+        self.assertIn("Appendix", body)     # inline string, sheet 3
 
     def test_dominant_keyword(self):
         self.assertEqual(vt.TextExtractor.dominant_keyword("budget budget report report report"), "Report")
@@ -96,6 +118,22 @@ class TestStore(unittest.TestCase):
         self.st.delete(fid)
         self.assertEqual(self.st.count(), 0)
         self.assertEqual(self.st.search("secret"), [])
+
+    def test_extension_filter_and_grouping_queries(self):
+        self._add("report.docx", "quarterly revenue merger")
+        self._add("book.xlsx", "revenue zephyrium confidential")
+        self._add("notes.txt", "revenue meeting notes")
+        self.st.commit()
+        # distinct extensions with counts
+        self.assertEqual({r["ext"] for r in self.st.extensions()}, {".docx", ".xlsx", ".txt"})
+        # full-text search restricted to one extension
+        self.assertEqual(len(self.st.search("revenue")), 3)
+        self.assertEqual([r["filename"] for r in self.st.search("revenue", exts=[".xlsx"])], ["book.xlsx"])
+        # filename search restricted to one extension
+        self.assertEqual([r["filename"] for r in self.st.search_filename("book", exts=[".xlsx"])], ["book.xlsx"])
+        # grouping helpers
+        self.assertEqual([r["filename"] for r in self.st.files_by_ext(".txt")], ["notes.txt"])
+        self.assertEqual(len(self.st.files_by_source(self.tmp)), 3)
 
 
 class TestIndexer(unittest.TestCase):
