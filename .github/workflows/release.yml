@@ -1,0 +1,92 @@
+name: Build & Release (Windows)
+
+# Auto-builds the Windows .exe on a cloud Windows runner and publishes it as a
+# release asset. Triggers when a version tag (v*) is pushed; can also be run
+# manually (build artifact only, no release) via the Actions tab.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install PyInstaller
+        run: python -m pip install --upgrade pip pyinstaller
+
+      - name: Run core tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Build (onedir, no UPX) from spec
+        run: pyinstaller --noconfirm Vault_Toolkit.spec
+
+      - name: Sanity check the build
+        shell: pwsh
+        run: |
+          if (-not (Test-Path dist/Vault_Toolkit/Vault_Toolkit.exe)) { throw "exe was not produced" }
+          if (-not (Test-Path dist/Vault_Toolkit/_internal/_sqlite3.pyd)) { throw "sqlite3 missing from build" }
+          Write-Host "Build OK: exe + sqlite3 present"
+
+      - name: Package zip + checksum
+        id: pkg
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          if ($tag -notmatch '^v') { $tag = "dev-" + $env:GITHUB_SHA.Substring(0,7) }
+          $zip = "Vault_Toolkit-$tag-windows-x64.zip"
+          Compress-Archive -Path dist/Vault_Toolkit -DestinationPath $zip -Force
+          $sha = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          "$sha  $zip" | Out-File -Encoding ascii "$zip.sha256"
+          "zip=$zip"   | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "sha=$sha"   | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Packaged $zip  (SHA-256 $sha)"
+
+      - name: Upload build artifact (every run)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Vault_Toolkit-windows-x64
+          path: |
+            ${{ steps.pkg.outputs.zip }}
+            ${{ steps.pkg.outputs.zip }}.sha256
+
+      - name: Publish release (tag pushes only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $zip = "${{ steps.pkg.outputs.zip }}"
+          $sha = "${{ steps.pkg.outputs.sha }}"
+          $notes = @"
+          Automated Windows x64 build of Vault Toolkit $tag.
+
+          **Download:** ``$zip`` — extract the whole folder and run ``Vault_Toolkit/Vault_Toolkit.exe`` (keep the ``_internal`` folder beside it). First launch may show a SmartScreen notice (unsigned) -> More info -> Run anyway.
+
+          **SHA-256** (``$zip``):
+          ``````
+          $sha
+          ``````
+
+          See CHANGELOG.md for what changed in this version.
+          "@
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $zip "$zip.sha256" --clobber
+            gh release edit $tag --notes "$notes" --latest
+          } else {
+            gh release create $tag $zip "$zip.sha256" --title "Vault Toolkit $tag" --notes "$notes" --latest
+          }
+          Write-Host "Published release $tag"

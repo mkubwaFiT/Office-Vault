@@ -3,7 +3,7 @@
 All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [2.2.0] — 2026-07-13
 
 ### Added
 - **Group by extension type** — the browse tree can group *all* files of a type
@@ -15,11 +15,15 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 - **Multi-select delete** — select any mix of files, subfolders, or whole
   extension groups and send them to the Recycle Bin (recoverable) in one action,
   via button, right-click, or the `Delete` key. File contents are never altered.
+- **Automated Windows build** — a GitHub Actions workflow builds the `.exe` on a
+  Windows runner and publishes the release asset when a `v*` tag is pushed.
 
 ### Changed
 - **Excel search now covers every worksheet** — `.xlsx` extraction reads the
   shared-string table *and* each sheet's inline strings, so a word in any sheet of
   a multi-worksheet workbook is indexed and searchable.
+
+[2.2.0]: https://github.com/mkubwaFiT/Office-Vault/releases/tag/v2.2.0
 
 ## [2.1.0] — 2026-07-06
 
