@@ -69,6 +69,22 @@ class TestExtractor(unittest.TestCase):
             f.write(b"not a zip")
         self.assertEqual(vt.TextExtractor.extract(bad, ".docx"), "")
 
+    def test_plaintext_family_and_rtf(self):
+        # new plain-text-family formats read directly
+        for name, text in [("data.csv", "id,name\n1,alpha budget"),
+                           ("notes.md", "# Heading\nbeta report")]:
+            p = os.path.join(self.tmp, name)
+            _write(p, text)
+            self.assertIn("budget" if name.endswith("csv") else "report",
+                          vt.TextExtractor.extract(p, os.path.splitext(name)[1]))
+        # RTF control words are stripped to readable text
+        rtf = os.path.join(self.tmp, "note.rtf")
+        _write(rtf, r"{\rtf1\ansi\deff0 Hello \b confidential\b0  world}")
+        body = vt.TextExtractor.extract(rtf, ".rtf")
+        self.assertIn("Hello", body)
+        self.assertIn("confidential", body)
+        self.assertNotIn("rtf1", body)
+
     def test_xlsx_extracts_all_worksheets(self):
         # A word that only appears as an inline string in sheet 2/3 must still be
         # extracted, so full-text search reaches every worksheet of a workbook.
@@ -174,6 +190,26 @@ class TestIndexer(unittest.TestCase):
         self._run(self.src)
         self.assertEqual(self._run(self.src)["added"], 0)
 
+    def test_excluded_dirs_are_pruned(self):
+        # a tracked file inside an excluded dir must NOT be indexed
+        nm = os.path.join(self.src, "node_modules")
+        os.makedirs(nm)
+        _write(os.path.join(nm, "junk.txt"), "should be skipped")
+        self._run(self.src)
+        names = [r["filename"] for r in self.st.all_files()]
+        self.assertIn("a.txt", names)
+        self.assertNotIn("junk.txt", names)
+
+    def test_oversized_files_are_skipped(self):
+        orig = vt.MAX_FILE_BYTES
+        vt.MAX_FILE_BYTES = 8                              # tiny cap for the test
+        try:
+            _write(os.path.join(self.src, "big.txt"), "x" * 200)
+            self._run(self.src)
+            self.assertNotIn("big.txt", [r["filename"] for r in self.st.all_files()])
+        finally:
+            vt.MAX_FILE_BYTES = orig
+
     def test_cancellation_stops_scan(self):
         big = os.path.join(self.tmp, "big")
         os.makedirs(big)
@@ -194,7 +230,8 @@ class TestChunkAndEngines(unittest.TestCase):
         body = "intro line\nthe secret budget is here\nfooter"
         hits = vt.find_query_lines(body, "secret budget")
         self.assertEqual(hits, [(2, "the secret budget is here")])
-        self.assertEqual(vt.best_match_line(body, "secret"), "the secret budget is here")
+        # best_match_line now prefixes the line number (VS Code style)
+        self.assertEqual(vt.best_match_line(body, "secret"), "L2: the secret budget is here")
         self.assertEqual(vt.find_query_lines("", "x"), [])
         self.assertEqual(vt.best_match_line("no match here", "zzz"), "")
 

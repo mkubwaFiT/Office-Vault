@@ -3,6 +3,25 @@
 All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased] — crawl hardening & more formats
+
+Portable ideas adapted (in Python, not a rewrite) from the *ODST* and *DocQuery*
+architecture design docs.
+
+### Added
+- **More text formats** — `.csv`, `.tsv`, `.md`, `.log`, `.json`, `.xml`, `.ini`
+  read directly, and `.rtf` via a stdlib control-word stripper. All indexed &
+  searchable; still zero third-party dependencies.
+- **Line-numbered match context** — result snippets now show `L<n>: <line>`.
+
+### Changed / Hardened
+- **Crawler skips system/VCS/build dirs** (`$Recycle.Bin`, `System Volume
+  Information`, `Windows`, `node_modules`, `.git`, `AppData`, …) and never
+  descends into the vault — faster scans, no junk indexed.
+- **Oversized files skipped** (default > 50 MB) to bound memory/time.
+- **Decompression-bomb guard** — OOXML zip members larger than 300 MB (uncompressed)
+  are skipped during extraction.
+
 ## [0.0.1] — 2026-07-14 — **Trove** (rebrand reset)
 
 First release under the **Trove** name. Version numbering resets to `0.0.1` to

@@ -66,13 +66,31 @@ OOXML_EXTS = {'.docx', '.xlsx', '.pptx'}          # can be text-extracted with s
 LEGACY_OLE_EXTS = {'.doc', '.xls', '.ppt'}         # pre-2007 binary — no stdlib parser
 IMAGE_EXTS = {'.png', '.jpg', '.jpeg'}             # OCR-eligible (optional engine)
 PDF_EXTS = {'.pdf'}                                # text + optional OCR (needs PyMuPDF)
-TRACKED_EXTS = set(MS_EXTENSIONS) | {'.txt'} | IMAGE_EXTS | PDF_EXTS
+# Plain-text-family formats read directly as UTF-8 (stdlib — fits the lean core).
+PLAINTEXT_EXTS = {'.txt', '.csv', '.tsv', '.md', '.log', '.json', '.xml', '.ini'}
+RTF_EXTS = {'.rtf'}                                # control-word stripping (stdlib)
+TRACKED_EXTS = set(MS_EXTENSIONS) | PLAINTEXT_EXTS | RTF_EXTS | IMAGE_EXTS | PDF_EXTS
 DANGER_EXTS = {'.exe', '.bat', '.ps1', '.vbs', '.scr', '.dll', '.js', '.wsf'}
+
+# Directory names skipped entirely while crawling (system / VCS / build / junk).
+# Prevents wasting time and index space on OS and toolchain internals.
+EXCLUDE_DIR_NAMES = {
+    '$recycle.bin', 'system volume information', 'windows', 'winsxs',
+    '$windows.~ws', '$windows.~bt', 'recovery', 'appdata', 'programdata',
+    'node_modules', '.git', '.svn', '.hg', '__pycache__', '.cache',
+    'site-packages', '.venv', 'venv', '.trash', '_recyclebin',
+}
+MAX_FILE_BYTES = 50 * 1024 * 1024     # skip individual files larger than this
+ZIP_MEMBER_CAP = 300 * 1024 * 1024    # skip OOXML zip members bigger than this (bomb guard)
 
 # Human-readable type labels for grouping / the Type column.
 TYPE_LABELS = dict(MS_EXTENSIONS)
-TYPE_LABELS.update({'.txt': 'Text', '.pdf': 'PDF Documents',
-                    '.png': 'Images', '.jpg': 'Images', '.jpeg': 'Images'})
+TYPE_LABELS.update({
+    '.txt': 'Text', '.md': 'Markdown', '.log': 'Logs', '.ini': 'Config',
+    '.csv': 'CSV / Data', '.tsv': 'CSV / Data', '.json': 'JSON / Data', '.xml': 'XML / Data',
+    '.rtf': 'Rich Text', '.pdf': 'PDF Documents',
+    '.png': 'Images', '.jpg': 'Images', '.jpeg': 'Images',
+})
 
 INDEX_TEXT_CAP = 1_000_000     # max chars of extracted body stored per file
 PREVIEW_CHUNK = 200_000        # bytes of a large .txt loaded per "page"
@@ -271,9 +289,11 @@ class TextExtractor:
     @staticmethod
     def extract(path, ext, cap=INDEX_TEXT_CAP):
         try:
-            if ext == '.txt':
+            if ext in PLAINTEXT_EXTS:
                 with open(path, 'r', encoding='utf-8', errors='ignore') as f:
                     return f.read(cap)
+            if ext in RTF_EXTS:
+                return TextExtractor._rtf(path, cap)
             if ext == '.docx':
                 return TextExtractor._ooxml(path, cap, member='word/document.xml')
             if ext == '.xlsx':
@@ -287,6 +307,16 @@ class TextExtractor:
         except Exception as e:
             log.warning("extract failed for %s: %s", path, e)
         return ""
+
+    @staticmethod
+    def _rtf(path, cap):
+        """Strip RTF control words / groups to plain text — stdlib, no dependency."""
+        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+            raw = f.read(cap * 4)
+        raw = re.sub(r"\\'[0-9a-fA-F]{2}", ' ', raw)   # hex escapes
+        raw = re.sub(r'\\[a-zA-Z]+-?\d* ?', ' ', raw)  # control words
+        raw = raw.replace('{', ' ').replace('}', ' ').replace('\\', ' ')
+        return re.sub(r'\s+', ' ', raw).strip()[:cap]
 
     @staticmethod
     def _pdf(path, cap):
@@ -333,6 +363,8 @@ class TextExtractor:
                 n for n in names if n.startswith('xl/worksheets/sheet') and n.endswith('.xml')
             )
             for name in parts:
+                if z.getinfo(name).file_size > ZIP_MEMBER_CAP:   # decompression-bomb guard
+                    continue
                 with z.open(name) as fh:
                     for _event, elem in ET.iterparse(fh):
                         if elem.tag.rsplit('}', 1)[-1] == 't' and elem.text:
@@ -355,6 +387,8 @@ class TextExtractor:
                 sorted(n for n in names if member_prefix and n.startswith(member_prefix) and n.endswith('.xml'))
             )
             for name in targets:
+                if z.getinfo(name).file_size > ZIP_MEMBER_CAP:   # decompression-bomb guard
+                    continue
                 with z.open(name) as fh:
                     for _event, elem in ET.iterparse(fh):
                         if elem.tag.rsplit('}', 1)[-1] == 't' and elem.text:
@@ -620,7 +654,10 @@ class Indexer:
             for root_dir, dirs, files in os.walk(target_dir):
                 if self._cancel.is_set():
                     break
+                # Prune excluded system/VCS/build dirs in place (stops descent too).
+                dirs[:] = [d for d in dirs if d.lower() not in EXCLUDE_DIR_NAMES]
                 if os.path.normpath(root_dir).startswith(self.vault_dir):
+                    dirs[:] = []          # never descend into the vault
                     continue
                 for name in files:
                     if self._cancel.is_set():
@@ -649,6 +686,8 @@ class Indexer:
 
     def _index_one(self, src, ext, copy_to_vault):
         st = os.stat(src)
+        if st.st_size > MAX_FILE_BYTES:      # skip oversized files (memory/time guard)
+            return False
         mtime = st.st_mtime
         existing = self.store.get_by_path(src)
         if existing and existing["mtime"] == mtime and existing["body"] is not None:
@@ -817,12 +856,14 @@ def find_query_lines(text, query, limit=50):
 
 
 def best_match_line(text, query, width=120):
-    """The single most relevant line (trimmed) for a compact result snippet."""
+    """The single most relevant line for a compact result snippet, prefixed with
+    its line number (VS Code `L<n>:` style)."""
     lines = find_query_lines(text, query, limit=1)
     if not lines:
         return ""
-    s = lines[0][1]
-    return (s[:width] + " …") if len(s) > width else s
+    n, s = lines[0]
+    s = (s[:width] + " …") if len(s) > width else s
+    return f"L{n}: {s}"
 
 
 # ===========================================================================
@@ -1265,13 +1306,13 @@ class TroveApp:
         if not os.path.exists(path):
             self.viewer_info.set(f"⚠  Original missing — {path}")
             self.text.insert(tk.END, row["body"] or "[File no longer at original location.]")
-        elif ext == ".txt":
+        elif ext in PLAINTEXT_EXTS:
             self._preview_path = path
             self._preview_offset = 0
             self.viewer_info.set(f"👁  Read-only preview — {path}")
             self.load_more_preview()
             return
-        elif ext in OOXML_EXTS:
+        elif ext in OOXML_EXTS or ext in RTF_EXTS:
             self.viewer_info.set(f"👁  Extracted text preview — {path}")
             body = row["body"] if row["body"] is not None else TextExtractor.extract(path, ext)
             self.text.insert(tk.END, body or "[No extractable text found.]")
