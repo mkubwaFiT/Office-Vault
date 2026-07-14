@@ -27,11 +27,11 @@ them (see [Optional power features](#optional-power-features)).
 
 **[Download the latest Windows build →](https://github.com/mkubwaFiT/Office-Vault/releases/latest)** (Windows 10/11, 64-bit)
 
-Grab `Vault_Toolkit-vX.Y.Z-windows-x64.zip`, **extract the whole ZIP**, and run
-`Vault_Toolkit/Vault_Toolkit.exe`. Keep the `.exe` and its `_internal/` folder
-together — it's a fast-start *folder* build, not a lone `.exe`. A `.sha256` file
-is attached if you want to verify the download. (First launch may show a
-SmartScreen notice because the build is unsigned → *More info → Run anyway*.)
+Grab `Trove-vX.Y.Z-windows-x64.zip`, **extract the whole ZIP**, and run
+`Trove/Trove.exe`. Keep the `.exe` and its `_internal/` folder together — it's a
+fast-start *folder* build, not a lone `.exe`. A `.sha256` file is attached if you
+want to verify the download. (First launch may show a SmartScreen notice because
+the build is unsigned → *More info → Run anyway*.)
 
 ## Features
 
@@ -115,7 +115,7 @@ Data lives in `~/TextVault_Data/`: a `vault.db` catalog, in-app notes under
 
 Startup and large-disk handling are addressed at two layers:
 
-- **Build:** `Vault_Toolkit.spec` uses a **onedir, no-UPX** configuration instead
+- **Build:** `Trove.spec` uses a **onedir, no-UPX** configuration instead
   of `--onefile` + UPX, avoiding a full runtime re-extraction (and Defender
   re-scan) on every launch.
 - **Runtime:** indexing is **index-in-place**, **streamed** (batched SQLite
@@ -127,12 +127,12 @@ Startup and large-disk handling are addressed at two layers:
 
 - **Python 3.8+** with Tkinter (bundled with standard CPython on Windows/macOS).
 - No third-party dependencies — standard library only.
-- **PyInstaller** is needed only to build the `.exe` (`build_vault.py` installs it).
+- **PyInstaller** is needed only to build the `.exe` (`build_trove.py` installs it).
 
 ## Running from source
 
 ```bash
-python vault_toolkit.py
+python trove.py
 ```
 
 The vault lives in `~/TextVault_Data/` (kept for backward compatibility with
@@ -152,19 +152,19 @@ existing metadata).
    worksheets included) or switch to *Filename*. The **Type** dropdown restricts the
    search to one extension. Results list matching files with a snippet; the box is
    debounced. `Ctrl+F` focuses it, `Esc` / **✕** clears it.
-4. **Clean up junk** — select any mix of files, subfolders, or extension groups and
+4. **Search inside files** — the *Hybrid* mode (if the semantic extra is installed)
+   re-ranks results by meaning; opening a hit **highlights** every match and jumps
+   to it. Toggle **👁 Watch** to keep the index live as files change.
+5. **Clean up junk** — select any mix of files, subfolders, or extension groups and
    click **🗑 Delete Selected** (or press `Delete`) to send them to the Recycle Bin.
-4. **Preview & notes** — Office and indexed `.txt` open **read-only** (large text
-   pages in via *Load more*); right-click → *Open Original Location* to edit in the
-   source app. **New Note** creates an editable note in the vault that auto-saves
-   (`Ctrl+S` to save now).
-5. **Tidy up** — *Find Duplicates* recycles exact-duplicate copies; *Report* writes
+6. **Preview & notes** — indexed files open **read-only** (large text pages in via
+   *Load more*); right-click → *Open Original Location* to edit in the source app.
+   **New Note** creates an editable note in the vault that auto-saves (`Ctrl+S`).
+7. **Tidy up** — *Find Duplicates* recycles exact-duplicate copies; *Report* writes
    a summary; *Open Vault* opens the data folder.
-6. **Security tab** — review executables/scripts flagged during indexing; run a
-   *Defender Scan*, or send a flagged file to the Recycle Bin.
-7. **Deep Purge tab** — select files and *Deep Delete* to remove them from the
-   index, their original location, and the Windows RecentDocs registry. This
-   action asks you to type `PURGE` to confirm.
+8. **Security & Deep Purge tabs** — review flagged executables (Defender scan or
+   recycle), or *Deep Delete* files from the index + disk + RecentDocs registry
+   (type `PURGE` to confirm).
 
 All deletions go to the Recycle Bin / Trash — see [Safety](#safety).
 
@@ -173,11 +173,12 @@ All deletions go to the Recycle Bin / Trash — see [Safety](#safety).
 PyInstaller produces a binary for the OS it runs on, so build on **Windows**:
 
 ```bash
-python build_vault.py
+python build_trove.py
 ```
 
-Output: `dist/Vault_Toolkit/Vault_Toolkit.exe`. Distribute the **entire**
-`dist/Vault_Toolkit/` folder (zip it) — onedir builds are a folder, not a lone `.exe`.
+Output: `dist/Trove/Trove.exe`. Distribute the **entire** `dist/Trove/` folder
+(zip it) — onedir builds are a folder, not a lone `.exe`. (Or just push a `v*`
+tag and GitHub Actions builds and publishes it for you.)
 
 ## Platform notes
 
@@ -210,13 +211,14 @@ build artifacts, and `*.exe` are all `.gitignore`d.
 
 | File | Purpose |
 |------|---------|
-| `vault_toolkit.py` | The application (Tkinter, single file). |
-| `Vault_Toolkit.spec` | PyInstaller spec — fast-launch onedir/no-UPX config. |
-| `build_vault.py` | Build script: cleans artifacts and builds from the spec. |
-| `README.md` | This document. |
-| `CHANGELOG.md` | Version history. |
-| `LICENSE` | MIT license. |
-| `.gitignore` | Excludes build output, caches, executables, and vault data. |
+| `trove.py` | The application (Tkinter, single file; stdlib core + optional engines). |
+| `Trove.spec` | PyInstaller spec — fast-launch onedir/no-UPX config. |
+| `build_trove.py` | Build script: cleans artifacts and builds from the spec. |
+| `assets/` | App icon (`trove.ico`/`.png`) + its stdlib generator `make_icon.py`. |
+| `requirements-optional.txt` | Optional ML/OCR/watch extras (auto-detected). |
+| `tests/` | Headless unit tests for the core layers. |
+| `.github/workflows/` | CI (tests) + auto Windows build/release. |
+| `README.md` · `CHANGELOG.md` · `LICENSE` · `.gitignore` | Docs, history, license, ignores. |
 
 ## License
 

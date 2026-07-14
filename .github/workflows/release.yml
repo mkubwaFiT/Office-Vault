@@ -30,13 +30,13 @@ jobs:
         run: python -m unittest discover -s tests -v
 
       - name: Build (onedir, no UPX) from spec
-        run: pyinstaller --noconfirm Vault_Toolkit.spec
+        run: pyinstaller --noconfirm Trove.spec
 
       - name: Sanity check the build
         shell: pwsh
         run: |
-          if (-not (Test-Path dist/Vault_Toolkit/Vault_Toolkit.exe)) { throw "exe was not produced" }
-          if (-not (Test-Path dist/Vault_Toolkit/_internal/_sqlite3.pyd)) { throw "sqlite3 missing from build" }
+          if (-not (Test-Path dist/Trove/Trove.exe)) { throw "exe was not produced" }
+          if (-not (Test-Path dist/Trove/_internal/_sqlite3.pyd)) { throw "sqlite3 missing from build" }
           Write-Host "Build OK: exe + sqlite3 present"
 
       - name: Package zip + checksum
@@ -45,8 +45,8 @@ jobs:
         run: |
           $tag = "${{ github.ref_name }}"
           if ($tag -notmatch '^v') { $tag = "dev-" + $env:GITHUB_SHA.Substring(0,7) }
-          $zip = "Vault_Toolkit-$tag-windows-x64.zip"
-          Compress-Archive -Path dist/Vault_Toolkit -DestinationPath $zip -Force
+          $zip = "Trove-$tag-windows-x64.zip"
+          Compress-Archive -Path dist/Trove -DestinationPath $zip -Force
           $sha = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
           "$sha  $zip" | Out-File -Encoding ascii "$zip.sha256"
           "zip=$zip"   | Out-File -FilePath $env:GITHUB_OUTPUT -Append
@@ -56,7 +56,7 @@ jobs:
       - name: Upload build artifact (every run)
         uses: actions/upload-artifact@v4
         with:
-          name: Vault_Toolkit-windows-x64
+          name: Trove-windows-x64
           path: |
             ${{ steps.pkg.outputs.zip }}
             ${{ steps.pkg.outputs.zip }}.sha256
@@ -71,9 +71,9 @@ jobs:
           $zip = "${{ steps.pkg.outputs.zip }}"
           $sha = "${{ steps.pkg.outputs.sha }}"
           $notes = @"
-          Automated Windows x64 build of Vault Toolkit $tag.
+          Automated Windows x64 build of Trove $tag.
 
-          **Download:** ``$zip`` — extract the whole folder and run ``Vault_Toolkit/Vault_Toolkit.exe`` (keep the ``_internal`` folder beside it). First launch may show a SmartScreen notice (unsigned) -> More info -> Run anyway.
+          **Download:** ``$zip`` — extract the whole folder and run ``Trove/Trove.exe`` (keep the ``_internal`` folder beside it). First launch may show a SmartScreen notice (unsigned) -> More info -> Run anyway.
 
           **SHA-256** (``$zip``):
           ``````
@@ -87,6 +87,6 @@ jobs:
             gh release upload $tag $zip "$zip.sha256" --clobber
             gh release edit $tag --notes "$notes" --latest
           } else {
-            gh release create $tag $zip "$zip.sha256" --title "Vault Toolkit $tag" --notes "$notes" --latest
+            gh release create $tag $zip "$zip.sha256" --title "Trove $tag" --notes "$notes" --latest
           }
           Write-Host "Published release $tag"

@@ -5,7 +5,7 @@ dist/
 
 # PyInstaller onedir runtime bundle (if built into / copied to the repo root)
 _internal/
-Vault_Toolkit/
+Trove/
 
 # Compiled / cache
 __pycache__/

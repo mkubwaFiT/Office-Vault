@@ -19,6 +19,6 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Byte-compile
-        run: python -m py_compile vault_toolkit.py build_vault.py
+        run: python -m py_compile trove.py build_trove.py assets/make_icon.py
       - name: Run core tests
         run: python -m unittest discover -s tests -v

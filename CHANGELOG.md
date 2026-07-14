@@ -3,7 +3,12 @@
 All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased] — rebrand to **Trove**
+## [0.0.1] — 2026-07-14 — **Trove** (rebrand reset)
+
+First release under the **Trove** name. Version numbering resets to `0.0.1` to
+mark the fresh identity (the pre-rebrand "Vault Toolkit" releases remain in the
+history as v1.0.0–v2.2.0). Source/build files renamed: `trove.py`, `Trove.spec`,
+`build_trove.py`; the built app is now `Trove.exe`.
 
 ### Added
 - **New identity: Trove** — new product name, window title, and app icon

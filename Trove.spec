@@ -1,6 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 #
-# Optimized build spec for the harmonized Vault Toolkit.
+# Optimized build spec for Trove (onedir, no UPX).
 #
 # Why this is faster than the old OfficeVault/TextVault one-file builds:
 #   * onedir (exclude_binaries=True + COLLECT) instead of --onefile.
@@ -14,7 +14,7 @@
 block_cipher = None
 
 a = Analysis(
-    ['vault_toolkit.py'],
+    ['trove.py'],
     pathex=[],
     binaries=[],
     datas=[('assets/trove.png', 'assets')],  # window icon, bundled into _internal/assets
@@ -43,7 +43,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,          # onedir mode
-    name='Vault_Toolkit',
+    name='Trove',
     icon='assets/trove.ico',        # Trove app icon
     debug=False,
     bootloader_ignore_signals=False,
@@ -64,5 +64,5 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name='Vault_Toolkit',
+    name='Trove',
 )

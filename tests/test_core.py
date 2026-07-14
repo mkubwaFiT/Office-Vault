@@ -10,7 +10,7 @@ import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import vault_toolkit as vt  # noqa: E402
+import trove as vt  # noqa: E402
 
 
 def _write(path, data, mode="w"):

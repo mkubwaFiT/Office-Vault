@@ -1,20 +1,20 @@
 """
-Unified builder for the harmonized Vault Toolkit.
+Builder for Trove.
 
 Run this on Windows (PyInstaller produces a binary for the OS it runs on):
 
-    python build_vault.py
+    python build_trove.py
 
-It builds from Vault_Toolkit.spec, which is configured for a FAST-launch
-onedir/no-UPX build. Output lands in dist/Vault_Toolkit/Vault_Toolkit.exe
-(ship the whole dist/Vault_Toolkit folder, or zip it).
+It builds from Trove.spec, which is configured for a FAST-launch onedir/no-UPX
+build. Output lands in dist/Trove/Trove.exe (ship the whole dist/Trove folder,
+or zip it).
 """
 import os
 import shutil
 import subprocess
 import sys
 
-SPEC_FILE = "Vault_Toolkit.spec"
+SPEC_FILE = "Trove.spec"
 
 
 def clean_registry():
@@ -51,8 +51,8 @@ def build_executable():
     print("Building executable from spec (onedir, no UPX)...")
     subprocess.check_call([sys.executable, "-m", "PyInstaller", "--noconfirm", SPEC_FILE])
     print("\nBuild complete.")
-    print("Executable: dist/Vault_Toolkit/Vault_Toolkit.exe")
-    print("Ship the entire dist/Vault_Toolkit/ folder (zip it for distribution).")
+    print("Executable: dist/Trove/Trove.exe")
+    print("Ship the entire dist/Trove/ folder (zip it for distribution).")
 
 
 if __name__ == "__main__":
