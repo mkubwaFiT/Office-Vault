@@ -1,0 +1,22 @@
+# Optional acceleration extras for Trove.
+# The core app is standard-library only and needs NONE of these — install only
+# the features you want. Each is auto-detected at runtime and degrades gracefully
+# to keyword search / no-OCR if absent.
+#
+#   pip install -r requirements-optional.txt      # everything
+# or install individually:
+
+# Hybrid semantic search (re-ranks keyword hits by meaning). Pulls in PyTorch.
+sentence-transformers
+numpy
+
+# OCR: read text inside images and scanned PDFs. Also PyTorch-based; downloads
+# its model weights on first use.
+easyocr
+
+# PDF text extraction (+ embedded images for OCR).
+pymupdf
+
+# Event-driven live folder watching. Without it, Trove falls back to a
+# lightweight stdlib mtime-poll, so watching still works — just less instantly.
+watchdog

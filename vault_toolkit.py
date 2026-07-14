@@ -1,15 +1,22 @@
 """
-Vault Toolkit — unified Text + Office document catalog, search and cleanup tool.
+Trove — local document catalog, deep search, and cleanup toolkit.
+(Repository: mkubwaFiT/Office-Vault. "Vault Toolkit" was the former name.)
 
-Architecture (v2, layered):
-  * TextExtractor  — stdlib-only text extraction (.txt + OOXML .docx/.xlsx/.pptx).
+Architecture (layered):
+  * TextExtractor  — stdlib text extraction (.txt + OOXML) + optional PDF/OCR.
   * VaultStore     — SQLite catalog with FTS5 full-text search (LIKE fallback).
   * Indexer        — cancellable, streaming, background disk scanner.
-  * VaultToolkitApp — Tkinter UI (browse / search / preview / security / purge).
+  * FolderWatcher  — live re-indexing (watchdog if present, else stdlib polling).
+  * SemanticRanker — optional hybrid re-rank (SentenceTransformers, if installed).
+  * OcrEngine      — optional OCR for images/PDF (EasyOCR, if installed).
+  * TroveApp       — Tkinter UI (browse / search / preview / security / purge).
 
 Design notes:
-  * Files are indexed *in place* by default (no whole-disk copying) — the vault
-    is a searchable catalog plus a home for in-app notes, not a duplicate store.
+  * The CORE is standard-library only: lean, fast, ~30 MB build. The heavy ML
+    features (semantic search, OCR) are OPTIONAL — they auto-activate only if the
+    extra packages are installed, and degrade gracefully to keyword search if not.
+  * Files are indexed *in place* (no whole-disk copying) — a searchable catalog
+    plus a home for in-app notes, not a duplicate store.
   * Everything heavy runs off the Tk thread; the UI marshals updates via after().
   * All deletes are recoverable (OS Recycle Bin / Trash, local fallback).
 """
@@ -57,22 +64,209 @@ MS_EXTENSIONS = {
 }
 OOXML_EXTS = {'.docx', '.xlsx', '.pptx'}          # can be text-extracted with stdlib
 LEGACY_OLE_EXTS = {'.doc', '.xls', '.ppt'}         # pre-2007 binary — no stdlib parser
-TRACKED_EXTS = set(MS_EXTENSIONS) | {'.txt'}
+IMAGE_EXTS = {'.png', '.jpg', '.jpeg'}             # OCR-eligible (optional engine)
+PDF_EXTS = {'.pdf'}                                # text + optional OCR (needs PyMuPDF)
+TRACKED_EXTS = set(MS_EXTENSIONS) | {'.txt'} | IMAGE_EXTS | PDF_EXTS
 DANGER_EXTS = {'.exe', '.bat', '.ps1', '.vbs', '.scr', '.dll', '.js', '.wsf'}
+
+# Human-readable type labels for grouping / the Type column.
+TYPE_LABELS = dict(MS_EXTENSIONS)
+TYPE_LABELS.update({'.txt': 'Text', '.pdf': 'PDF Documents',
+                    '.png': 'Images', '.jpg': 'Images', '.jpeg': 'Images'})
 
 INDEX_TEXT_CAP = 1_000_000     # max chars of extracted body stored per file
 PREVIEW_CHUNK = 200_000        # bytes of a large .txt loaded per "page"
 BATCH_COMMIT = 200             # files per DB transaction while indexing
 SEARCH_LIMIT = 500            # max search results returned to the UI
 
-log = logging.getLogger("vault")
+log = logging.getLogger("trove")
+
+
+# ===========================================================================
+# Optional acceleration engines — the CORE never depends on these. Each detects
+# its library lazily and degrades to a no-op / keyword fallback if it is absent,
+# so the stdlib-only build behaves exactly as before.
+#   pip install "sentence-transformers numpy"   # hybrid semantic search
+#   pip install easyocr                          # OCR for images / scanned PDFs
+#   pip install pymupdf                          # PDF text + embedded images
+#   pip install watchdog                         # event-driven folder watching
+# ===========================================================================
+def _module_available(modname):
+    # find_spec checks importability WITHOUT importing (so we never load torch at
+    # startup just to detect it — the heavy import happens lazily on first use).
+    try:
+        import importlib.util
+        return importlib.util.find_spec(modname) is not None
+    except Exception:
+        return False
+
+
+class OcrEngine:
+    """OCR via EasyOCR when installed; otherwise `available` is False and read()
+    returns "" so image/PDF indexing simply stores no text (graceful)."""
+    def __init__(self):
+        self.available = _module_available("easyocr")
+        self._reader = None
+
+    def read(self, path):
+        if not self.available:
+            return ""
+        try:
+            if self._reader is None:
+                import easyocr
+                self._reader = easyocr.Reader(['en'], gpu=False, verbose=False)
+            return " ".join(self._reader.readtext(path, detail=0))
+        except Exception as e:
+            log.warning("OCR failed for %s: %s", path, e)
+            return ""
+
+    def read_bytes(self, data):
+        if not self.available:
+            return ""
+        try:
+            import numpy as np  # noqa
+            from PIL import Image  # noqa
+            import io
+            if self._reader is None:
+                import easyocr
+                self._reader = easyocr.Reader(['en'], gpu=False, verbose=False)
+            img = np.array(Image.open(io.BytesIO(data)).convert("RGB"))
+            return " ".join(self._reader.readtext(img, detail=0))
+        except Exception as e:
+            log.warning("OCR (bytes) failed: %s", e)
+            return ""
+
+
+class SemanticRanker:
+    """Optional hybrid search: re-ranks keyword (FTS) candidates by embedding
+    similarity using SentenceTransformers. If the library is absent, `available`
+    is False and rerank() returns the candidates unchanged (pure keyword)."""
+    MODEL = "all-MiniLM-L6-v2"
+
+    def __init__(self):
+        self.available = _module_available("sentence_transformers") and _module_available("numpy")
+        self._model = None
+
+    def _load(self):
+        if self._model is None:
+            from sentence_transformers import SentenceTransformer
+            self._model = SentenceTransformer(self.MODEL)
+        return self._model
+
+    def rerank(self, query, rows, text_of):
+        """Return `rows` reordered by semantic similarity of text_of(row) to query.
+        Falls back to the original order on any error or if unavailable."""
+        if not self.available or not rows:
+            return rows
+        try:
+            import numpy as np
+            model = self._load()
+            texts = [text_of(r) or "" for r in rows]
+            qv = model.encode([query], normalize_embeddings=True)[0]
+            mv = model.encode(texts, normalize_embeddings=True)
+            scores = np.asarray(mv) @ np.asarray(qv)
+            return [r for _s, r in sorted(zip(scores, rows), key=lambda t: t[0], reverse=True)]
+        except Exception as e:
+            log.warning("semantic rerank failed: %s", e)
+            return rows
+
+
+class FolderWatcher:
+    """Live folder watching. Uses `watchdog` for event-driven notifications when
+    installed; otherwise falls back to a lightweight stdlib mtime-poll. Calls
+    on_change(folder) (debounced) whenever a watched folder's contents change."""
+    def __init__(self, on_change, interval=10):
+        self.on_change = on_change
+        self.interval = interval
+        self.folders = []
+        self._stop = threading.Event()
+        self._thread = None
+        self._observer = None
+        self._sigs = {}
+        self.backend = "watchdog" if _module_available("watchdog") else "poll"
+
+    @property
+    def running(self):
+        return bool(self._observer) or (self._thread is not None and self._thread.is_alive())
+
+    def start(self, folders):
+        self.stop()
+        self.folders = [f for f in folders if os.path.isdir(f)]
+        if not self.folders:
+            return
+        self._stop.clear()
+        if self.backend == "watchdog":
+            self._start_watchdog()
+        else:
+            self._thread = threading.Thread(target=self._poll_loop, daemon=True)
+            self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._observer:
+            try:
+                self._observer.stop()
+                self._observer.join(timeout=2)
+            except Exception:
+                pass
+            self._observer = None
+        self._thread = None
+
+    def _start_watchdog(self):
+        from watchdog.observers import Observer
+        from watchdog.events import FileSystemEventHandler
+
+        watcher = self
+
+        class _Handler(FileSystemEventHandler):
+            def on_any_event(self, event):
+                if event.is_directory:
+                    return
+                ext = os.path.splitext(event.src_path)[1].lower()
+                if ext in TRACKED_EXTS:
+                    watcher.on_change(os.path.dirname(event.src_path))
+
+        self._observer = Observer()
+        for folder in self.folders:
+            self._observer.schedule(_Handler(), folder, recursive=True)
+        self._observer.start()
+
+    def _signature(self, folder):
+        sig = {}
+        for root_dir, _dirs, files in os.walk(folder):
+            for name in files:
+                if os.path.splitext(name)[1].lower() in TRACKED_EXTS:
+                    p = os.path.join(root_dir, name)
+                    try:
+                        sig[p] = os.stat(p).st_mtime
+                    except OSError:
+                        pass
+        return sig
+
+    def _poll_loop(self):
+        self._sigs = {f: self._signature(f) for f in self.folders}
+        while not self._stop.wait(self.interval):
+            for folder in self.folders:
+                try:
+                    sig = self._signature(folder)
+                    if sig != self._sigs.get(folder):
+                        self._sigs[folder] = sig
+                        self.on_change(folder)
+                except Exception as e:
+                    log.warning("watch poll failed for %s: %s", folder, e)
+
+
+# Module-level optional engines (cheap to construct; heavy import is deferred).
+OCR = OcrEngine()
+SEMANTIC = SemanticRanker()
 
 
 # ===========================================================================
 # Text extraction
 # ===========================================================================
 class TextExtractor:
-    """Stdlib-only text extraction for indexing and preview."""
+    """Text extraction for indexing and preview. Core formats are stdlib-only;
+    PDF and image OCR use optional engines and yield "" when those are absent."""
 
     @staticmethod
     def extract(path, ext, cap=INDEX_TEXT_CAP):
@@ -86,9 +280,45 @@ class TextExtractor:
                 return TextExtractor._xlsx(path, cap)
             if ext == '.pptx':
                 return TextExtractor._ooxml(path, cap, member_prefix='ppt/slides/slide')
+            if ext in IMAGE_EXTS:
+                return OCR.read(path)[:cap]                 # "" unless EasyOCR present
+            if ext in PDF_EXTS:
+                return TextExtractor._pdf(path, cap)        # PyMuPDF text (+OCR) if present
         except Exception as e:
             log.warning("extract failed for %s: %s", path, e)
         return ""
+
+    @staticmethod
+    def _pdf(path, cap):
+        """PDF text via PyMuPDF (fitz) when installed; OCR embedded/scanned image
+        bytes if an OCR engine is available. Returns "" if PyMuPDF is absent."""
+        if not _module_available("fitz"):
+            return ""
+        texts, total = [], 0
+        try:
+            import fitz
+            with fitz.open(path) as doc:
+                for page in doc:
+                    t = page.get_text() or ""
+                    if t:
+                        texts.append(t)
+                        total += len(t)
+                    if total < cap and OCR.available:  # scanned page / embedded images
+                        for img in page.get_images(full=True):
+                            try:
+                                data = doc.extract_image(img[0]).get("image")
+                                if data:
+                                    ocr = OCR.read_bytes(data)
+                                    if ocr:
+                                        texts.append(ocr)
+                                        total += len(ocr)
+                            except Exception:
+                                continue
+                    if total >= cap:
+                        break
+        except Exception as e:
+            log.warning("pdf extract failed for %s: %s", path, e)
+        return ' '.join(texts)[:cap]
 
     @staticmethod
     def _xlsx(path, cap):
@@ -425,7 +655,7 @@ class Indexer:
             return False  # unchanged, already indexed
 
         body = TextExtractor.extract(src, ext)
-        category = TextExtractor.dominant_keyword(body) if ext == '.txt' else MS_EXTENSIONS.get(ext, "Documents")
+        category = TextExtractor.dominant_keyword(body) if ext == '.txt' else TYPE_LABELS.get(ext, "Documents")
 
         vault_path = None
         if copy_to_vault:
@@ -566,16 +796,46 @@ def hash_file(path):
     return h.hexdigest()
 
 
+def query_tokens(query):
+    return [t.lower() for t in re.findall(r"\w+", query or "")]
+
+
+def find_query_lines(text, query, limit=50):
+    """VS Code-style: return [(line_no, line_text)] for lines that contain any
+    query token. Used for result snippets and jumping the preview to the hit."""
+    tokens = query_tokens(query)
+    if not text or not tokens:
+        return []
+    hits = []
+    for i, line in enumerate(text.splitlines(), 1):
+        low = line.lower()
+        if any(t in low for t in tokens):
+            hits.append((i, line.strip()))
+            if len(hits) >= limit:
+                break
+    return hits
+
+
+def best_match_line(text, query, width=120):
+    """The single most relevant line (trimmed) for a compact result snippet."""
+    lines = find_query_lines(text, query, limit=1)
+    if not lines:
+        return ""
+    s = lines[0][1]
+    return (s[:width] + " …") if len(s) > width else s
+
+
 # ===========================================================================
 # Tkinter UI
 # ===========================================================================
-class VaultToolkitApp:
+class TroveApp:
     NOTES_LABEL = "My Notes (Vault)"
 
     def __init__(self, root):
         self.root = root
-        self.root.title("Vault Toolkit v2.2 (Text + Office) - Assembler: KIMANI S.M.")
+        self.root.title("Trove — Document Search & OCR   ·   Assembler: KIMANI S.M.")
         self.root.geometry("1240x760")
+        self._set_window_icon()
 
         self.vault_dir = os.path.join(os.path.expanduser("~"), "TextVault_Data")
         self.notes_dir = os.path.join(self.vault_dir, "Notes")
@@ -589,6 +849,7 @@ class VaultToolkitApp:
         self.indexed_folders = self.store.get_meta("indexed_folders", [])
         self.indexer = Indexer(self.store, self.vault_dir,
                                on_progress=self._progress_cb, on_done=self._done_cb)
+        self.watcher = FolderWatcher(on_change=self._on_watch_change)
 
         # UI/runtime state
         self.current = None            # current file sqlite Row (or None)
@@ -599,12 +860,34 @@ class VaultToolkitApp:
         self._navigating = False
         self._search_timer = None
         self._autosave_timer = None
+        self._watch_timer = None
         self._preview_path = None
         self._preview_offset = 0
+        self._active_query = ""        # current search text, for hit highlighting
 
         self.setup_ui()
         self.populate_browse()
         self.root.after(200, self.auto_recall_indexed)
+
+    def _set_window_icon(self):
+        """Set the window icon from the bundled/source PNG if present (best-effort)."""
+        try:
+            bases = [getattr(sys, "_MEIPASS", None), os.path.dirname(os.path.abspath(__file__))]
+            for base in bases:
+                if not base:
+                    continue
+                png = os.path.join(base, "assets", "trove.png")
+                if os.path.exists(png):
+                    self._icon_img = tk.PhotoImage(file=png)
+                    self.root.iconphoto(True, self._icon_img)
+                    return
+        except Exception as e:
+            log.info("window icon not set: %s", e)
+
+    def _capability_summary(self):
+        return (f"Semantic: {'on' if SEMANTIC.available else 'off'}  ·  "
+                f"OCR: {'on' if OCR.available else 'off'}  ·  "
+                f"Watch: {self.watcher.backend}")
 
     def _init_logging(self):
         logging.basicConfig(
@@ -651,6 +934,7 @@ class VaultToolkitApp:
         btn(tb, "Index Drive/Folder", self.index_folder)
         self.btn_cancel = btn(tb, "Cancel", self.cancel_index)
         self.btn_cancel.config(state=tk.DISABLED)
+        self.btn_watch = btn(tb, "👁 Watch: Off", self.toggle_watch)
         btn(tb, "New Note", self.new_note)
         self.btn_save = btn(tb, "Save", self.save_current)
         btn(tb, "Clear", self.clear_view)
@@ -669,9 +953,11 @@ class VaultToolkitApp:
                                       width=11, state="readonly")
         self.ext_combo.pack(side=tk.LEFT, padx=(2, 4))
         self.ext_combo.bind("<<ComboboxSelected>>", lambda e: self.run_search())
+        modes = ["Full-text", "Filename"] + (["Hybrid"] if SEMANTIC.available else [])
         self.search_mode = tk.StringVar(value="Full-text")
-        ttk.Combobox(sf, textvariable=self.search_mode, values=["Full-text", "Filename"],
-                     width=9, state="readonly").pack(side=tk.LEFT, padx=(0, 4))
+        mode_cb = ttk.Combobox(sf, textvariable=self.search_mode, values=modes, width=9, state="readonly")
+        mode_cb.pack(side=tk.LEFT, padx=(0, 4))
+        mode_cb.bind("<<ComboboxSelected>>", lambda e: self.run_search())
         self.search_var = tk.StringVar()
         self.search_var.trace("w", self.on_search_changed)
         tk.Entry(sf, textvariable=self.search_var, width=24).pack(side=tk.LEFT)
@@ -684,6 +970,7 @@ class VaultToolkitApp:
         tk.Label(sb, textvariable=self.status_var, anchor="w").pack(side=tk.LEFT, padx=6)
         self.progress = ttk.Progressbar(sb, mode="indeterminate", length=180)
         self.progress.pack(side=tk.RIGHT, padx=6, pady=2)
+        tk.Label(sb, text=self._capability_summary(), anchor="e", fg="#888").pack(side=tk.RIGHT, padx=10)
 
         # Main split
         self.paned = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
@@ -757,6 +1044,7 @@ class VaultToolkitApp:
         ys.config(command=self.text.yview)
         ys.pack(side=tk.RIGHT, fill=tk.Y)
         self.text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.text.tag_configure("hit", background="#fde047", foreground="#111827")
         self.text.bind("<KeyRelease>", self.on_edit)
         self.load_more_btn = tk.Button(frame, text="Load more ▼", command=self.load_more_preview)
         # packed only when a large .txt is truncated
@@ -798,6 +1086,7 @@ class VaultToolkitApp:
         self.tree.delete(*self.tree.get_children())
         self.item_meta.clear()
         self.loaded_nodes.clear()
+        self._active_query = ""
         self._refresh_ext_filter()
         if self.group_mode.get() == "Folder":
             for row in self.store.source_dirs():
@@ -836,17 +1125,15 @@ class VaultToolkitApp:
         leaf = self.tree.insert(
             parent, "end", text=f"{f['filename']}{extra_text}",
             values=(self._fmt_time(f["mtime"]), self._human_size(f["size"]),
-                    MS_EXTENSIONS.get(f["ext"], f["ext"] or "file"), f["source_dir"]),
+                    TYPE_LABELS.get(f["ext"], f["ext"] or "file"), f["source_dir"]),
         )
         self.item_meta[leaf] = ("file", f["id"])
         return leaf
 
     @staticmethod
     def _ext_label(ext):
-        if ext in MS_EXTENSIONS:
-            return f"{MS_EXTENSIONS[ext]} ({ext})"
-        if ext == ".txt":
-            return "Text files (.txt)"
+        if ext in TYPE_LABELS:
+            return f"{TYPE_LABELS[ext]} ({ext})"
         return f"{ext or '(no extension)'} files"
 
     @staticmethod
@@ -879,6 +1166,7 @@ class VaultToolkitApp:
 
     def run_search(self):
         query = self.search_var.get().strip()
+        self._active_query = query
         exts = None if self.ext_filter.get() == "All types" else [self.ext_filter.get()]
 
         # No text query: honour a standalone Type filter, else show the browse tree.
@@ -893,24 +1181,24 @@ class VaultToolkitApp:
         self.item_meta.clear()
         self.loaded_nodes.clear()
 
-        if self.search_mode.get() == "Filename":
+        mode = self.search_mode.get()
+        if mode == "Filename":
             rows = self.store.search_filename(query, exts=exts)
-            snippets = False
         else:
-            rows = self.store.search(query, exts=exts)
-            snippets = self.store.fts
+            rows = self.store.search(query, exts=exts)          # keyword/FTS candidates
+            if mode == "Hybrid":                                 # optional semantic re-rank
+                rows = SEMANTIC.rerank(query, rows, text_of=lambda r: r["body"])
 
         scope = "" if not exts else f" in {exts[0]}"
-        header = self.tree.insert("", "end", text=f"Results for '{query}'{scope}  ({len(rows)})", open=True)
+        header = self.tree.insert("", "end", text=f"[{mode}] '{query}'{scope}  ({len(rows)})", open=True)
         self.item_meta[header] = ("results",)
         for f in rows:
-            snip = ""
-            if snippets and "snippet" in f.keys() and f["snippet"]:
-                snip = f"   —   {f['snippet']}"
-            elif not self.store.fts and f["body"]:
-                snip = self._like_snippet(f["body"], query)
-            self._insert_file_node(header, f, extra_text=snip)
-        self.status_var.set(f"{len(rows)} match(es) for '{query}'{scope}")
+            # VS Code-style: show the exact line the term was found on.
+            snip = best_match_line(f["body"], query) if f["body"] else ""
+            if not snip and mode != "Filename" and "snippet" in f.keys() and f["snippet"]:
+                snip = f["snippet"]
+            self._insert_file_node(header, f, extra_text=(f"   —   {snip}" if snip else ""))
+        self.status_var.set(f"{len(rows)} match(es) · {mode} · '{query}'{scope}")
 
     def _show_type_listing(self, ext):
         self.tree.delete(*self.tree.get_children())
@@ -922,14 +1210,6 @@ class VaultToolkitApp:
         for f in rows:
             self._insert_file_node(header, f)
         self.status_var.set(f"{len(rows)} {ext} file(s)")
-
-    @staticmethod
-    def _like_snippet(body, query):
-        i = body.lower().find(query.lower())
-        if i < 0:
-            return ""
-        start, end = max(0, i - 30), min(len(body), i + len(query) + 30)
-        return f"   —   … {body[start:end].strip()} …"
 
     def clear_search(self):
         if self.search_var.get():
@@ -978,10 +1258,10 @@ class VaultToolkitApp:
                     self.text.insert(tk.END, f.read())
             except Exception as e:
                 self.text.insert(tk.END, f"[Could not read note: {e}]")
+            self._highlight_hits()
             return
 
         # read-only preview
-        self.text.config(state=tk.NORMAL)
         if not os.path.exists(path):
             self.viewer_info.set(f"⚠  Original missing — {path}")
             self.text.insert(tk.END, row["body"] or "[File no longer at original location.]")
@@ -993,10 +1273,17 @@ class VaultToolkitApp:
             return
         elif ext in OOXML_EXTS:
             self.viewer_info.set(f"👁  Extracted text preview — {path}")
-            body = row["body"]
-            if body is None:
-                body = TextExtractor.extract(path, ext)
+            body = row["body"] if row["body"] is not None else TextExtractor.extract(path, ext)
             self.text.insert(tk.END, body or "[No extractable text found.]")
+        elif ext in IMAGE_EXTS:
+            note = "" if OCR.available else "   (install EasyOCR to read text inside images)"
+            self.viewer_info.set(f"🖼  Image — OCR text{note} — {path}")
+            self.text.insert(tk.END, (row["body"] or "").strip() or "[No OCR text — image indexed by name only.]")
+        elif ext in PDF_EXTS:
+            note = "" if _module_available("fitz") else "   (install PyMuPDF to read PDF text)"
+            self.viewer_info.set(f"📄  PDF text{note} — {path}")
+            body = row["body"] if row["body"] is not None else TextExtractor.extract(path, ext)
+            self.text.insert(tk.END, (body or "").strip() or "[No extractable text.]")
         elif ext in LEGACY_OLE_EXTS:
             self.viewer_info.set(f"🔒  Legacy binary — {path}")
             self.text.insert(
@@ -1004,7 +1291,27 @@ class VaultToolkitApp:
                 f"Preview not available for legacy {ext} (pre-2007 OLE format).\n"
                 "Right-click → Open Original Location to view in Microsoft Office."
             )
+        self._highlight_hits()
         self.text.config(state=tk.DISABLED)
+
+    def _highlight_hits(self):
+        """Highlight all query-token occurrences in the preview and scroll to the
+        first — the 'jump to the matching chunk' behaviour."""
+        self.text.tag_remove("hit", "1.0", tk.END)
+        first = None
+        for tok in query_tokens(self._active_query):
+            start = "1.0"
+            while True:
+                pos = self.text.search(tok, start, tk.END, nocase=True)
+                if not pos:
+                    break
+                end = f"{pos}+{len(tok)}c"
+                self.text.tag_add("hit", pos, end)
+                if first is None:
+                    first = pos
+                start = end
+        if first:
+            self.text.see(first)
 
     def load_more_preview(self):
         if not self._preview_path:
@@ -1021,12 +1328,40 @@ class VaultToolkitApp:
         self.text.insert(tk.END, chunk)
         self._preview_offset += len(chunk.encode("utf-8", "ignore"))
         more = len(chunk) == PREVIEW_CHUNK
+        self._highlight_hits()
         self.text.config(state=tk.DISABLED)
         if more:
             self.load_more_btn.pack(side=tk.BOTTOM, pady=3)
             self.viewer_info.set(f"👁  Read-only preview (showing first {self._preview_offset // 1000} KB) — {self._preview_path}")
         else:
             self.load_more_btn.pack_forget()
+
+    # -- live folder watching ------------------------------------------------
+    def toggle_watch(self):
+        if self.watcher.running:
+            self.watcher.stop()
+            self.btn_watch.config(text="👁 Watch: Off")
+            self.status_var.set("Folder watching stopped.")
+            return
+        folders = [f for f in self.indexed_folders if os.path.isdir(f)]
+        if not folders:
+            messagebox.showinfo("Watch", "Index a folder first, then enable watching.")
+            return
+        self.watcher.start(folders)
+        self.btn_watch.config(text=f"👁 Watch: On ({self.watcher.backend})")
+        self.status_var.set(f"Watching {len(folders)} folder(s) live via {self.watcher.backend}.")
+
+    def _on_watch_change(self, folder):
+        """Watcher thread → debounce → re-index the changed folder on the UI thread."""
+        def kick():
+            if not self.indexer.running:
+                self._begin_index(folder, silent=True)
+        try:
+            if self._watch_timer:
+                self.root.after_cancel(self._watch_timer)
+            self._watch_timer = self.root.after(1500, kick)
+        except Exception:
+            pass
 
     # -- notes / editing -----------------------------------------------------
     def new_note(self):
@@ -1105,6 +1440,7 @@ class VaultToolkitApp:
         self.load_more_btn.pack_forget()
         self.current = None
         self._preview_path = None
+        self._active_query = ""
         self.viewer_info.set("Cleared. Select a file to preview.")
         self.status_var.set("Ready")
 
@@ -1375,7 +1711,11 @@ class VaultToolkitApp:
         messagebox.showinfo("Deep Purge Complete", f"Deep purge executed on {purged} file(s).")
 
 
+# Backwards-compatible alias (the app was formerly named "Vault Toolkit").
+VaultToolkitApp = TroveApp
+
+
 if __name__ == "__main__":
     root = tk.Tk()
-    app = VaultToolkitApp(root)
+    app = TroveApp(root)
     root.mainloop()

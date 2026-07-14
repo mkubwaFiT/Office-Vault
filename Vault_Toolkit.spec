@@ -17,7 +17,7 @@ a = Analysis(
     ['vault_toolkit.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('assets/trove.png', 'assets')],  # window icon, bundled into _internal/assets
     hiddenimports=['sqlite3'],  # belt-and-suspenders; also NOT in excludes below
     hookspath=[],
     hooksconfig={},
@@ -44,6 +44,7 @@ exe = EXE(
     [],
     exclude_binaries=True,          # onedir mode
     name='Vault_Toolkit',
+    icon='assets/trove.ico',        # Trove app icon
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

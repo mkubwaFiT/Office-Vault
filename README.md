@@ -1,19 +1,25 @@
-# Vault Toolkit
+<p align="center">
+  <img src="assets/trove.png" width="120" alt="Trove icon">
+</p>
+
+# Trove
 
 [![CI](https://github.com/mkubwaFiT/Office-Vault/actions/workflows/ci.yml/badge.svg)](https://github.com/mkubwaFiT/Office-Vault/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/mkubwaFiT/Office-Vault)](https://github.com/mkubwaFiT/Office-Vault/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A single-window desktop tool for collecting, organizing, searching, and securely
-purging text notes and Microsoft Office documents scattered across your drives.
+**Trove** — a single-window desktop tool that indexes, deep-searches, previews, and
+cleans up the documents scattered across your drives: text notes, Microsoft Office
+files, PDFs, and images. It catalogs folders you point it at (in place — no copying),
+searches *inside* every file (all Excel worksheets included), and provides
+security/cleanup utilities (Defender scan, duplicate removal, deep purge).
 
-It indexes folders you point it at, copies tracked files into a local vault,
-groups them by source and type, lets you edit `.txt` notes inline, and provides
-security/cleanup utilities (Defender scan, duplicate removal, deep purge with
-Windows Recent-Docs registry scrubbing).
+> Trove is the evolution of the earlier `TextVault` / `OfficeVault` / "Vault Toolkit"
+> tools. The GitHub repository keeps its original name, **Office-Vault**.
 
-> This is the **harmonized** successor to the earlier `TextVault` and `OfficeVault`
-> tools, merged into one codebase and rebuilt for fast startup.
+The **core is standard-library only** — lean, fast, ~30 MB. Heavier capabilities
+(semantic search, OCR) are **optional extras** that activate only if you install
+them (see [Optional power features](#optional-power-features)).
 
 ---
 
@@ -42,6 +48,14 @@ SmartScreen notice because the build is unsigned → *More info → Run anyway*.
 - **Multi-select cleanup** — select any mix of files, subfolders, or whole
   extension groups and send them to the Recycle Bin in one action (button,
   right-click, or `Delete`). Recoverable; contents are never altered.
+- **Jump-to-match preview** — search results show the exact line the term was
+  found on (VS Code style), and opening a hit scrolls to and **highlights** every
+  occurrence in the preview.
+- **Live folder watching** — toggle **👁 Watch** to keep the index current as
+  files change. Uses `watchdog` if installed, else a built-in stdlib poll.
+- **PDF & image awareness** — `.pdf`, `.png`, `.jpg`, `.jpeg` are catalogued and
+  filterable; their text becomes searchable when the optional OCR/PDF extras are
+  installed (see below).
 - **Scales to large disks — index in place** — indexing catalogs files where they
   live instead of copying every document into the vault, and runs in a
   **cancellable** background scan with a live progress/count and a **Cancel** button.
@@ -60,16 +74,38 @@ SmartScreen notice because the build is unsigned → *More info → Run anyway*.
   scrub its traces from the Windows Explorer `RecentDocs` MRU registry.
 - **Vault report** — generate a summary report (Japanese-localized).
 
+## Optional power features
+
+The core needs nothing beyond the standard library. These extras are **auto-detected
+at runtime** — install only what you want; without them Trove falls back to keyword
+search / no-OCR and runs exactly as before. The status bar shows what's active.
+
+```bash
+pip install -r requirements-optional.txt     # or pick individual lines
+```
+
+| Extra | Unlocks | Fallback when absent |
+|-------|---------|----------------------|
+| `sentence-transformers`, `numpy` | **Hybrid search** — a *Hybrid* mode that re-ranks keyword hits by meaning (`all-MiniLM-L6-v2`) | Full-text (FTS5) keyword search |
+| `easyocr` | **OCR** — read text inside `.png/.jpg/.jpeg` and scanned PDFs | Images indexed by filename only |
+| `pymupdf` | **PDF text** (+ embedded-image OCR) | PDFs indexed by filename only |
+| `watchdog` | **Event-driven** live folder watching | Built-in stdlib mtime-poll |
+
+> These pull in PyTorch (~2 GB) and are **not** in the shipped `.exe`, which stays
+> lean. Install them into a Python environment and run Trove from source to use them.
+
 ## Architecture
 
-The app is layered (single file, stdlib only):
+The app is layered (single file; core is stdlib-only):
 
 | Layer | Responsibility |
 |-------|----------------|
-| `TextExtractor` | Stdlib text extraction for `.txt` + OOXML (`zipfile` + `xml.etree`). |
+| `TextExtractor` | Text extraction for `.txt` + OOXML (`zipfile` + `xml.etree`); optional PDF/OCR. |
 | `VaultStore` | SQLite catalog with an FTS5 virtual table (LIKE fallback). |
 | `Indexer` | Cancellable, streaming, batched background disk scanner. |
-| `VaultToolkitApp` | Tkinter UI: browse / search / preview / security / purge. |
+| `FolderWatcher` | Live re-indexing — `watchdog` if present, else stdlib polling. |
+| `SemanticRanker` / `OcrEngine` | Optional ML engines; no-ops if their libs are absent. |
+| `TroveApp` | Tkinter UI: browse / search / preview / security / purge. |
 
 Data lives in `~/TextVault_Data/`: a `vault.db` catalog, in-app notes under
 `Notes/`, a `vault.log`, and a `_RecycleBin/` delete fallback. An existing

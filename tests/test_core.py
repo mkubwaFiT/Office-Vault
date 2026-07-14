@@ -143,8 +143,9 @@ class TestIndexer(unittest.TestCase):
         os.makedirs(os.path.join(self.src, "sub"))
         _write(os.path.join(self.src, "a.txt"), "budget report finance")
         _docx(os.path.join(self.src, "sub", "b.docx"), "Confidential merger plan")
-        _write(os.path.join(self.src, "c.exe"), b"MZ", "wb")          # danger
-        _write(os.path.join(self.src, "ignore.png"), b"x", "wb")      # untracked
+        _write(os.path.join(self.src, "c.exe"), b"MZ", "wb")          # danger -> flagged
+        _write(os.path.join(self.src, "pic.png"), b"x", "wb")         # image: tracked (empty body w/o OCR)
+        _write(os.path.join(self.src, "skip.zip"), b"x", "wb")        # genuinely untracked
         self.st = vt.VaultStore(os.path.join(self.tmp, "idx.db"))
 
     def tearDown(self):
@@ -161,11 +162,13 @@ class TestIndexer(unittest.TestCase):
 
     def test_index_counts_flags_and_search(self):
         res = self._run(self.src)
-        self.assertEqual(res["scanned"], 2)                 # a.txt + b.docx (png/exe excluded)
-        self.assertEqual(res["added"], 2)
+        self.assertEqual(res["scanned"], 3)                 # a.txt + b.docx + pic.png (.zip untracked)
+        self.assertEqual(res["added"], 3)
         self.assertEqual(res["sec"], [("Executable/Script", os.path.join(self.src, "c.exe"))])
         self.assertFalse(res["canc"])
         self.assertTrue(any("b.docx" in r["filename"] for r in self.st.search("merger")))
+        # the image is catalogued (indexed by name) even with no OCR engine present
+        self.assertTrue(any("pic.png" in r["filename"] for r in self.st.all_files()))
 
     def test_reindex_is_idempotent(self):
         self._run(self.src)
@@ -184,6 +187,47 @@ class TestIndexer(unittest.TestCase):
         idx._run(big, False)
         self.assertTrue(res["canc"])
         self.assertEqual(res["added"], 0)
+
+
+class TestChunkAndEngines(unittest.TestCase):
+    def test_find_query_lines_and_best_line(self):
+        body = "intro line\nthe secret budget is here\nfooter"
+        hits = vt.find_query_lines(body, "secret budget")
+        self.assertEqual(hits, [(2, "the secret budget is here")])
+        self.assertEqual(vt.best_match_line(body, "secret"), "the secret budget is here")
+        self.assertEqual(vt.find_query_lines("", "x"), [])
+        self.assertEqual(vt.best_match_line("no match here", "zzz"), "")
+
+    def test_optional_engines_degrade_gracefully(self):
+        # On a machine without the ML extras these are simply disabled no-ops.
+        ocr = vt.OcrEngine()
+        if not ocr.available:
+            self.assertEqual(ocr.read("/nonexistent.png"), "")
+        sem = vt.SemanticRanker()
+        rows = [{"body": "a"}, {"body": "b"}]
+        if not sem.available:  # rerank must return candidates unchanged
+            self.assertEqual(sem.rerank("q", rows, text_of=lambda r: r["body"]), rows)
+
+
+class TestFolderWatcher(unittest.TestCase):
+    def test_polling_watcher_detects_change(self):
+        import time
+        tmp = tempfile.mkdtemp()
+        _write(os.path.join(tmp, "seed.txt"), "one")
+        fired = []
+        w = vt.FolderWatcher(on_change=lambda folder: fired.append(folder), interval=1)
+        w.backend = "poll"  # force the stdlib fallback for a deterministic test
+        w.start([tmp])
+        try:
+            time.sleep(0.3)
+            _write(os.path.join(tmp, "new.txt"), "two")   # change after baseline
+            deadline = time.time() + 6
+            while not fired and time.time() < deadline:
+                time.sleep(0.3)
+        finally:
+            w.stop()
+        self.assertTrue(fired, "polling watcher did not detect the new file")
+        self.assertEqual(fired[0], tmp)
 
 
 if __name__ == "__main__":
