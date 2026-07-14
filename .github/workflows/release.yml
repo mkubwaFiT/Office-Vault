@@ -50,10 +50,30 @@ jobs:
           Write-Host "Self-test passed (exit 0)."
           # 2) Launch the real GUI and confirm it starts and survives (no startup crash).
           $g = Start-Process -FilePath $exe -PassThru
-          Start-Sleep -Seconds 10
+          Start-Sleep -Seconds 8
+          # 3) Screenshot the desktop (captures the running Trove window) -> artifact.
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          try {
+            Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+            $vs  = [System.Windows.Forms.SystemInformation]::VirtualScreen
+            $bmp = New-Object System.Drawing.Bitmap $vs.Width, $vs.Height
+            $gfx = [System.Drawing.Graphics]::FromImage($bmp)
+            $gfx.CopyFromScreen($vs.Location, [System.Drawing.Point]::Empty, $vs.Size)
+            $bmp.Save("$PWD\artifacts\trove-windows.png", [System.Drawing.Imaging.ImageFormat]::Png)
+            $gfx.Dispose(); $bmp.Dispose()
+            Write-Host "Screenshot saved ($($vs.Width)x$($vs.Height))."
+          } catch { Write-Host "Screenshot capture failed: $_" }
           if ($g.HasExited) { throw "GUI exited early (exit $($g.ExitCode)) — startup crash" }
-          Write-Host "GUI launched and stayed alive 10s (pid $($g.Id)). Stopping it."
+          Write-Host "GUI launched and stayed alive (pid $($g.Id)). Stopping it."
           Stop-Process -Id $g.Id -Force
+
+      - name: Upload screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Trove-windows-screenshot
+          path: artifacts/trove-windows.png
+          if-no-files-found: warn
 
       - name: Package zip + checksum
         id: pkg
