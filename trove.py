@@ -1756,7 +1756,62 @@ class TroveApp:
 VaultToolkitApp = TroveApp
 
 
+def _selftest():
+    """Headless self-check that the (frozen) runtime actually works: sqlite/FTS5,
+    text extraction, and Tk init. Writes a report to TEMP and exits 0 on success,
+    1 on failure. Used by CI to verify the built .exe launches on Windows."""
+    import tempfile
+    import traceback
+    report, ok = [], True
+
+    def check(name, fn):
+        nonlocal ok
+        try:
+            fn()
+            report.append(f"PASS  {name}")
+        except Exception as e:
+            ok = False
+            report.append(f"FAIL  {name}: {e}\n{traceback.format_exc()}")
+
+    def _store():
+        st = VaultStore(os.path.join(tempfile.mkdtemp(), "selftest.db"))
+        st.upsert({"original_path": "/x/a.txt", "vault_path": None, "filename": "a.txt",
+                   "ext": ".txt", "category": "T", "source_dir": "/x", "editable": 0,
+                   "mtime": 1.0, "size": 1, "body": "hello trove full text search"})
+        st.commit()
+        assert any(r["filename"] == "a.txt" for r in st.search("trove")), "search returned nothing"
+        st.close()
+
+    def _extract():
+        p = os.path.join(tempfile.mkdtemp(), "d.docx")
+        with zipfile.ZipFile(p, "w") as z:
+            z.writestr("word/document.xml", '<w:document xmlns:w="http://w"><w:t>frozen build ok</w:t></w:document>')
+        assert "frozen" in TextExtractor.extract(p, ".docx"), "docx extraction failed"
+
+    def _tk():
+        r = tk.Tk()
+        r.withdraw()
+        r.update()
+        r.destroy()
+
+    check("sqlite / FTS5 / catalog", _store)
+    check("text extraction (OOXML)", _extract)
+    check("tkinter GUI init", _tk)
+    report.append(f"engines: OCR={OCR.available} Semantic={SEMANTIC.available} "
+                  f"Watch={FolderWatcher(lambda f: None).backend}")
+    summary = "\n".join(report) + ("\n\nSELFTEST OK" if ok else "\n\nSELFTEST FAILED")
+    print(summary)
+    try:
+        with open(os.path.join(tempfile.gettempdir(), "trove_selftest.txt"), "w") as f:
+            f.write(summary)
+    except Exception:
+        pass
+    sys.exit(0 if ok else 1)
+
+
 if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        _selftest()
     root = tk.Tk()
     app = TroveApp(root)
     root.mainloop()

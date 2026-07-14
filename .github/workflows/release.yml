@@ -39,6 +39,22 @@ jobs:
           if (-not (Test-Path dist/Trove/_internal/_sqlite3.pyd)) { throw "sqlite3 missing from build" }
           Write-Host "Build OK: exe + sqlite3 present"
 
+      - name: Verify the exe runs (real Windows)
+        shell: pwsh
+        run: |
+          $exe = "dist/Trove/Trove.exe"
+          # 1) Deterministic self-check of the FROZEN runtime (sqlite/FTS, extraction, Tk).
+          $p = Start-Process -FilePath $exe -ArgumentList "--selftest" -PassThru -Wait
+          if (Test-Path "$env:TEMP\trove_selftest.txt") { Write-Host "---- self-test report ----"; Get-Content "$env:TEMP\trove_selftest.txt" }
+          if ($p.ExitCode -ne 0) { throw "self-test FAILED (exit $($p.ExitCode))" }
+          Write-Host "Self-test passed (exit 0)."
+          # 2) Launch the real GUI and confirm it starts and survives (no startup crash).
+          $g = Start-Process -FilePath $exe -PassThru
+          Start-Sleep -Seconds 10
+          if ($g.HasExited) { throw "GUI exited early (exit $($g.ExitCode)) — startup crash" }
+          Write-Host "GUI launched and stayed alive 10s (pid $($g.Id)). Stopping it."
+          Stop-Process -Id $g.Id -Force
+
       - name: Package zip + checksum
         id: pkg
         shell: pwsh
