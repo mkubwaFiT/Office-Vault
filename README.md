@@ -21,6 +21,12 @@ The **core is standard-library only** — lean, fast, ~30 MB. Heavier capabiliti
 (semantic search, OCR) are **optional extras** that activate only if you install
 them (see [Optional power features](#optional-power-features)).
 
+<p align="center">
+  <img src="assets/trove-windows.png" width="760" alt="Trove running on Windows 11">
+  <br>
+  <em>Trove running on Windows — screenshot captured automatically in CI on every build.</em>
+</p>
+
 ---
 
 ## Download
