@@ -3,7 +3,7 @@
 All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased] — crawl hardening & more formats
+## [0.0.2] — 2026-07-14 — crawl hardening & more formats
 
 Portable ideas adapted (in Python, not a rewrite) from the *ODST* and *DocQuery*
 architecture design docs.
