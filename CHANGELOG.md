@@ -3,6 +3,17 @@
 All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.0.3] — 2026-07-14 — verified builds & living screenshot
+
+### Added
+- **`--selftest`** headless self-check (sqlite/FTS5, text extraction, Tk init).
+- **CI verifies the built `.exe` actually runs on Windows** — the release
+  pipeline runs `--selftest` and launches the real GUI (must survive without
+  crashing) on `windows-latest` *before* publishing.
+- **Screenshot in CI** — every build captures a desktop screenshot of the running
+  app and uploads it as an artifact; it is embedded in the README and
+  **auto-refreshed to `main` on each release**.
+
 ## [0.0.2] — 2026-07-14 — crawl hardening & more formats
 
 Portable ideas adapted (in Python, not a rewrite) from the *ODST* and *DocQuery*
